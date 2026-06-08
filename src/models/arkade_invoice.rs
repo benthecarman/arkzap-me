@@ -18,6 +18,7 @@ pub struct ArkadeInvoice {
     pub payment_hash: Option<String>,
     pub preimage: String,
     pub swap_id: String,
+    #[serde(skip)]
     pub lnurlp_comment: Option<String>,
     pub state: i32,
     pub created_at: NaiveDateTime,

@@ -17,6 +17,7 @@ pub struct Invoice {
     pub amount_msats: i64,
     pub payment_hash: Option<String>,
     pub preimage: String,
+    #[serde(skip)]
     pub lnurlp_comment: Option<String>,
     pub state: i32,
     pub created_at: NaiveDateTime,

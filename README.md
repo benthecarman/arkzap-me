@@ -174,7 +174,6 @@ require at least `333000` millisatoshis.
 
 Optional query parameters:
 
-- `comment`: LNURL-pay comment, up to 100 characters
 - `nostr`: serialized Nostr zap request event
 
 Successful responses include a BOLT11 invoice in the `pr` field and a `verify`

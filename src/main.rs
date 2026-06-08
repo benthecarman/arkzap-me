@@ -611,7 +611,7 @@ mod db_tests {
             amount_msats: 2_000,
             payment_hash: Some("11".repeat(32)),
             preimage: String::new(),
-            lnurlp_comment: Some("hi".to_string()),
+            lnurlp_comment: None,
             state: InvoiceState::Pending as i32,
             expires_at: Some((chrono::Utc::now() + ChronoDuration::minutes(5)).naive_utc()),
         }

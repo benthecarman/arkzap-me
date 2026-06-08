@@ -24,7 +24,6 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::time::SystemTime;
 
-const MAX_COMMENT_LEN: usize = 100;
 const MAX_NOSTR_PARAM_LEN: usize = 16 * 1024;
 const ARKADE_MIN_SENDABLE_MSATS: u64 = 333_000;
 
@@ -287,8 +286,6 @@ pub async fn root() -> Html<&'static str> {
 pub struct LnurlCallbackParams {
     pub amount: Option<u64>, // User specified amount in MilliSatoshi
     #[serde(default, deserialize_with = "empty_string_as_none")]
-    pub comment: Option<String>, // Optional parameter to pass the LN WALLET user's comment to LN SERVICE
-    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub nostr: Option<String>, // Optional zap request
 }
 
@@ -394,7 +391,7 @@ pub(crate) async fn get_invoice_impl(
                     amount_msats: amount_msats as i64,
                     payment_hash: Some(payment_hash),
                     preimage: String::new(),
-                    lnurlp_comment: params.comment,
+                    lnurlp_comment: None,
                     state: InvoiceState::Pending as i32,
                     expires_at,
                 };
@@ -421,7 +418,7 @@ pub(crate) async fn get_invoice_impl(
                     payment_hash: Some(payment_hash),
                     preimage: String::new(),
                     swap_id,
-                    lnurlp_comment: params.comment,
+                    lnurlp_comment: None,
                     state: InvoiceState::Pending as i32,
                     expires_at,
                 };
@@ -543,14 +540,6 @@ fn validate_amount_msats(
 
 fn validate_callback_params(params: &LnurlCallbackParams) -> anyhow::Result<()> {
     if params
-        .comment
-        .as_ref()
-        .is_some_and(|comment| comment.chars().count() > MAX_COMMENT_LEN)
-    {
-        return Err(anyhow!("Comment is too long"));
-    }
-
-    if params
         .nostr
         .as_ref()
         .is_some_and(|nostr| nostr.len() > MAX_NOSTR_PARAM_LEN)
@@ -670,7 +659,7 @@ pub async fn get_lnurl_pay(
         max_sendable: state.max_sendable,
         tag: Tag::PayRequest,
         metadata,
-        comment_allowed: Some(100),
+        comment_allowed: None,
         allows_nostr: Some(true),
         nostr_pubkey: Some(
             state
@@ -1108,15 +1097,6 @@ mod tests {
     #[test]
     fn callback_validation_rejects_oversized_inputs() {
         let params = LnurlCallbackParams {
-            comment: Some("a".repeat(MAX_COMMENT_LEN + 1)),
-            ..Default::default()
-        };
-        assert_eq!(
-            validate_callback_params(&params).unwrap_err().to_string(),
-            "Comment is too long"
-        );
-
-        let params = LnurlCallbackParams {
             nostr: Some("a".repeat(MAX_NOSTR_PARAM_LEN + 1)),
             ..Default::default()
         };
@@ -1130,13 +1110,11 @@ mod tests {
     fn empty_callback_strings_deserialize_to_none() {
         let params: LnurlCallbackParams = serde_json::from_value(json!({
             "amount": 1_000,
-            "comment": "",
             "nostr": ""
         }))
         .unwrap();
 
         assert_eq!(params.amount, Some(1_000));
-        assert_eq!(params.comment, None);
         assert_eq!(params.nostr, None);
     }
 }
