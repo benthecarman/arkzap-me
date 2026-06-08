@@ -6,6 +6,7 @@ use crate::State;
 use anyhow::anyhow;
 use axum::extract::{Path, Query};
 use axum::http::{StatusCode, Uri};
+use axum::response::Html;
 use axum::{Extension, Json};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::Network;
@@ -26,6 +27,260 @@ use std::time::SystemTime;
 const MAX_COMMENT_LEN: usize = 100;
 const MAX_NOSTR_PARAM_LEN: usize = 16 * 1024;
 const ARKADE_MIN_SENDABLE_MSATS: u64 = 333_000;
+
+pub async fn root() -> Html<&'static str> {
+    Html(concat!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>arkzap.me</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fafafa;
+      --text: #151515;
+      --muted: #555555;
+      --line: #d9d9d9;
+      --panel: #ffffff;
+      --accent: #0f766e;
+      --accent-2: #c2410c;
+      --code: #252422;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 56px 0 48px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+      gap: 36px;
+      align-items: center;
+      padding-bottom: 48px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 84px;
+      line-height: 0.95;
+      font-weight: 800;
+    }
+
+    .lede {
+      max-width: 680px;
+      margin: 22px 0 0;
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.55;
+    }
+
+    .address {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      margin-top: 26px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 15px;
+      overflow-wrap: anywhere;
+    }
+
+    .mark {
+      position: relative;
+      min-height: 320px;
+      border: 1px solid var(--line);
+      background:
+        radial-gradient(circle at 28% 30%, rgba(15, 118, 110, 0.26), transparent 26%),
+        radial-gradient(circle at 68% 68%, rgba(194, 65, 12, 0.22), transparent 28%),
+        linear-gradient(135deg, #ffffff, #ededed);
+      overflow: hidden;
+    }
+
+    .mark::before,
+    .mark::after {
+      content: "";
+      position: absolute;
+      inset: 58px;
+      border: 2px solid rgba(21, 21, 21, 0.7);
+      transform: rotate(45deg);
+    }
+
+    .mark::after {
+      inset: 104px;
+      border-color: var(--accent);
+      transform: rotate(45deg) translate(22px, -22px);
+    }
+
+    .bolt {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 76px;
+      height: 128px;
+      transform: translate(-50%, -50%) skewX(-12deg);
+      background: var(--accent-2);
+      clip-path: polygon(48% 0, 94% 0, 62% 43%, 100% 43%, 34% 100%, 48% 57%, 0 57%);
+    }
+
+    section {
+      padding: 36px 0 0;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    p {
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .item {
+      min-height: 132px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .item strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 17px;
+    }
+
+    .item span {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .endpoints {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .endpoints li {
+      display: flex;
+      gap: 14px;
+      align-items: baseline;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    code {
+      color: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .method {
+      flex: 0 0 auto;
+      color: var(--accent);
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    footer {
+      padding-top: 36px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        width: min(100% - 24px, 1080px);
+        padding-top: 28px;
+      }
+
+      .hero,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      h1 {
+        font-size: 48px;
+      }
+
+      .mark {
+        min-height: 220px;
+      }
+
+      .endpoints li {
+        display: grid;
+        gap: 5px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <div>
+        <h1>arkzap.me</h1>
+        <p class="lede">LNURL-pay infrastructure for sending Lightning zaps to Bark and Arkade receive addresses.</p>
+        <div class="address">address@arkzap.me</div>
+      </div>
+      <div class="mark" aria-hidden="true"><div class="bolt"></div></div>
+    </div>
+
+    <section>
+      <h2>What It Does</h2>
+      <div class="grid">
+        <div class="item"><strong>LNURL-pay</strong><span>Publishes pay metadata for Bark and Arkade receive addresses.</span></div>
+        <div class="item"><strong>Nostr zaps</strong><span>Accepts zap request events and stores invoice verification data.</span></div>
+        <div class="item"><strong>Settlement checks</strong><span>Exposes verification for pending and settled invoices.</span></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Public Endpoints</h2>
+      <ul class="endpoints">
+        <li><span class="method">GET</span><code>/.well-known/lnurlp/:address</code></li>
+        <li><span class="method">GET</span><code>/get-invoice/:address?amount=1000</code></li>
+        <li><span class="method">GET</span><code>/verify/:desc_hash/:payment_hash</code></li>
+        <li><span class="method">GET</span><code>/health-check</code></li>
+      </ul>
+    </section>
+
+    <footer>arkzap.me runs arkzap-me v"#,
+        env!("CARGO_PKG_VERSION"),
+        r#".</footer>
+  </main>
+</body>
+</html>"#
+    ))
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -737,7 +992,17 @@ pub async fn fallback(uri: Uri) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::Html;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn root_returns_arkzap_info_page() {
+        let Html(body) = root().await;
+
+        assert!(body.contains("<title>arkzap.me</title>"));
+        assert!(body.contains("LNURL-pay infrastructure"));
+        assert!(body.contains("/.well-known/lnurlp/:address"));
+    }
 
     #[test]
     fn metadata_matches_lnurl_identifier_format() {

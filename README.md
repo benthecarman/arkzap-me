@@ -127,6 +127,14 @@ For Bark-only mode, omit the Arkade options and pass `--disable-arkade`.
 
 ## API
 
+### Service Info
+
+```http
+GET /
+```
+
+Returns an HTML information page for arkzap.me.
+
 ### Health Check
 
 ```http
