@@ -56,6 +56,7 @@ pub(crate) async fn get_invoice_impl(
 ) -> anyhow::Result<Bolt11Invoice> {
     let address = parse_receive_address(address)?;
     address.validate_network(state.network)?;
+    address.validate_enabled(state)?;
     validate_callback_params(&params)?;
 
     if params.amount.is_none() {
@@ -97,8 +98,11 @@ pub(crate) async fn get_invoice_impl(
             }
         }
         ReceiveAddress::Arkade(arkade_address) => {
-            let result = state
+            let arkade = state
                 .arkade
+                .as_ref()
+                .ok_or_else(|| anyhow!("Arkade support is disabled"))?;
+            let result = arkade
                 .invoice_for_address(
                     amount_msats / 1_000,
                     arkade_address,
@@ -328,6 +332,14 @@ impl ReceiveAddress {
 
         Ok(())
     }
+
+    fn validate_enabled(&self, state: &State) -> anyhow::Result<()> {
+        if matches!(self, ReceiveAddress::Arkade(_)) && state.arkade.is_none() {
+            return Err(anyhow!("Arkade support is disabled"));
+        }
+
+        Ok(())
+    }
 }
 
 impl Display for ReceiveAddress {
@@ -386,6 +398,9 @@ pub async fn get_lnurl_pay(
     };
     address
         .validate_network(state.network)
+        .map_err(handle_anyhow_error)?;
+    address
+        .validate_enabled(&state)
         .map_err(handle_anyhow_error)?;
     let min_sendable = address.min_sendable_msats(state.min_sendable);
     let address = address.to_string();
@@ -609,7 +624,15 @@ async fn refresh_arkade_invoice_receive_status(
         return Ok(());
     }
 
-    match state.arkade.claim_receive(&invoice.swap_id).await {
+    let Some(arkade) = state.arkade.as_ref() else {
+        error!(
+            "Cannot refresh Arkade invoice for payment_hash={payment_hash} swap_id={}: Arkade support is disabled",
+            invoice.swap_id
+        );
+        return Ok(());
+    };
+
+    match arkade.claim_receive(&invoice.swap_id).await {
         Ok(preimage) => {
             let mut conn = state.db_pool.get().map_err(|e| {
                 error!("DB connection error: {e}");
@@ -763,8 +786,12 @@ mod tests {
                 .to_string(),
             "Amount out of bounds"
         );
-        validate_amount_msats(ARKADE_MIN_SENDABLE_MSATS, ARKADE_MIN_SENDABLE_MSATS, 1_000_000)
-            .unwrap();
+        validate_amount_msats(
+            ARKADE_MIN_SENDABLE_MSATS,
+            ARKADE_MIN_SENDABLE_MSATS,
+            1_000_000,
+        )
+        .unwrap();
     }
 
     #[test]

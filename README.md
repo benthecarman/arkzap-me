@@ -50,9 +50,10 @@ local `.env` file on startup.
 | `LNURL_NSEC` | yes | | Nostr secret key used for zap support |
 | `LNURL_BARKD_URL` | yes | | Base URL for the `barkd` REST API |
 | `LNURL_BARKD_TOKEN` | no | | Bearer token for the `barkd` REST API |
-| `LNURL_ARKADE_XPRIV` | yes | | BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs |
-| `LNURL_ARKADE_SERVER_URL` | yes | | Arkade server URL used by the Arkade SDK |
-| `LNURL_ARKADE_BOLTZ_URL` | yes | | Boltz URL used by the Arkade SDK |
+| `LNURL_DISABLE_ARKADE` | no | `false` | Disable Arkade address support |
+| `LNURL_ARKADE_XPRIV` | yes, unless Arkade is disabled | | BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs |
+| `LNURL_ARKADE_SERVER_URL` | yes, unless Arkade is disabled | | Arkade server URL used by the Arkade SDK |
+| `LNURL_ARKADE_BOLTZ_URL` | yes, unless Arkade is disabled | | Boltz URL used by the Arkade SDK |
 | `LNURL_ARKADE_ESPLORA_URL` | no | `https://mempool.space/api` | Esplora URL used by the Arkade SDK wallet implementation |
 | `LNURL_ARKADE_INVOICE_EXPIRY_SECS` | no | | Optional Arkade-generated invoice expiry in seconds |
 | `LNURL_BIND` | no | `0.0.0.0` | HTTP bind address |
@@ -78,6 +79,10 @@ LNURL_ARKADE_ESPLORA_URL=http://127.0.0.1:3002
 LNURL_DOMAIN=example.com
 LNURL_PORT=3000
 ```
+
+Set `LNURL_DISABLE_ARKADE=true` or pass `--disable-arkade` to run with Bark-only
+address support. Arkade addresses will be rejected and the Arkade SDK client will
+not be initialized.
 
 For Diesel CLI commands, also set `DATABASE_URL` to the same Postgres URL:
 
@@ -117,6 +122,8 @@ cargo run -- \
   --arkade-boltz-url http://127.0.0.1:9001 \
   --domain example.com
 ```
+
+For Bark-only mode, omit the Arkade options and pass `--disable-arkade`.
 
 ## API
 

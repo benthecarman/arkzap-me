@@ -57,17 +57,21 @@ pub struct Config {
     #[clap(long, env = "LNURL_BARKD_TOKEN")]
     pub barkd_token: Option<String>,
 
+    /// Disable Arkade address support
+    #[clap(long, env = "LNURL_DISABLE_ARKADE", default_value_t = false)]
+    pub disable_arkade: bool,
+
     /// BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs
     #[clap(long, env = "LNURL_ARKADE_XPRIV")]
-    pub arkade_xpriv: String,
+    pub arkade_xpriv: Option<String>,
 
     /// Arkade server URL used by the Arkade SDK
     #[clap(long, env = "LNURL_ARKADE_SERVER_URL")]
-    pub arkade_server_url: String,
+    pub arkade_server_url: Option<String>,
 
     /// Boltz URL used by the Arkade SDK for Lightning receive swaps
     #[clap(long, env = "LNURL_ARKADE_BOLTZ_URL")]
-    pub arkade_boltz_url: String,
+    pub arkade_boltz_url: Option<String>,
 
     /// Esplora URL used by the Arkade SDK wallet implementation
     #[clap(

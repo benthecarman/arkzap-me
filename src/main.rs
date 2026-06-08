@@ -41,7 +41,7 @@ pub struct State {
     pub db_pool: Pool<ConnectionManager<PgConnection>>,
     pub keys: Keys,
     pub barkd: Arc<BarkdClient>,
-    pub arkade: Arc<ArkadeClient>,
+    pub arkade: Option<Arc<ArkadeClient>>,
 
     // -- config options --
     pub domain: String,
@@ -70,19 +70,30 @@ async fn main() -> anyhow::Result<()> {
         config.barkd_url.clone(),
         config.barkd_token.clone(),
     )?);
-    let arkade = Arc::new(
-        ArkadeClient::new(
-            db_pool.clone(),
-            config.arkade_xpriv.clone(),
-            config.arkade_server_url.clone(),
-            config.arkade_boltz_url.clone(),
-            config.arkade_esplora_url.clone(),
-            config.network,
-            config.arkade_invoice_expiry_secs,
-            config.request_timeout_seconds,
-        )
-        .await?,
-    );
+    let arkade = if config.disable_arkade {
+        None
+    } else {
+        Some(Arc::new(
+            ArkadeClient::new(
+                db_pool.clone(),
+                config
+                    .arkade_xpriv
+                    .clone()
+                    .context("LNURL_ARKADE_XPRIV is required unless Arkade support is disabled")?,
+                config.arkade_server_url.clone().context(
+                    "LNURL_ARKADE_SERVER_URL is required unless Arkade support is disabled",
+                )?,
+                config.arkade_boltz_url.clone().context(
+                    "LNURL_ARKADE_BOLTZ_URL is required unless Arkade support is disabled",
+                )?,
+                config.arkade_esplora_url.clone(),
+                config.network,
+                config.arkade_invoice_expiry_secs,
+                config.request_timeout_seconds,
+            )
+            .await?,
+        ))
+    };
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit_per_minute));
     let request_timeout = Duration::from_secs(config.request_timeout_seconds);
     let max_request_body_bytes = config.max_request_body_bytes;
@@ -173,7 +184,10 @@ async fn claim_paid_invoices(state: State) {
 
 async fn claim_paid_invoices_once(state: &State) -> anyhow::Result<()> {
     claim_paid_bark_invoices_once(state).await?;
-    claim_paid_arkade_invoices_once(state).await
+    if state.arkade.is_some() {
+        claim_paid_arkade_invoices_once(state).await?;
+    }
+    Ok(())
 }
 
 async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
@@ -218,6 +232,10 @@ async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
 }
 
 async fn claim_paid_arkade_invoices_once(state: &State) -> anyhow::Result<()> {
+    let arkade = state
+        .arkade
+        .as_ref()
+        .context("Arkade support is disabled")?;
     let invoices = {
         let mut conn = state.db_pool.get()?;
         ArkadeInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
@@ -236,7 +254,7 @@ async fn claim_paid_arkade_invoices_once(state: &State) -> anyhow::Result<()> {
             continue;
         }
 
-        match state.arkade.claim_receive(&invoice.swap_id).await {
+        match arkade.claim_receive(&invoice.swap_id).await {
             Ok(preimage) => {
                 let mut conn = state.db_pool.get()?;
                 if invoice.mark_settled(&mut conn, hex::encode(preimage))? {
