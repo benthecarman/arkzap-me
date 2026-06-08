@@ -1,0 +1,574 @@
+use crate::models::invoice::{Invoice, InvoiceState, NewInvoice};
+use crate::models::zap::Zap;
+use crate::State;
+use anyhow::anyhow;
+use axum::extract::{Path, Query};
+use axum::http::{StatusCode, Uri};
+use axum::{Extension, Json};
+use bitcoin::hashes::{sha256, Hash};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use diesel::Connection;
+use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::Bolt11InvoiceDescriptionRef;
+use lnurl::pay::PayResponse;
+use lnurl::Tag;
+use log::error;
+use nostr::{Event, JsonUtil};
+use serde::{de, Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
+use std::fmt::Display;
+use std::str::FromStr;
+use std::time::SystemTime;
+
+const MAX_COMMENT_LEN: usize = 100;
+const MAX_NOSTR_PARAM_LEN: usize = 16 * 1024;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LnurlCallbackParams {
+    pub amount: Option<u64>, // User specified amount in MilliSatoshi
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub comment: Option<String>, // Optional parameter to pass the LN WALLET user's comment to LN SERVICE
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub nostr: Option<String>, // Optional zap request
+}
+
+/// Creates a Lightning invoice and optionally stores zap request information.
+///
+/// This is the core implementation for generating invoices for LNURL-pay requests.
+///
+/// # Parameters
+/// * `state` - Application state containing LND client and configuration
+/// * `hash` - A description hash or identifier for the invoice
+/// * `amount_msats` - The invoice amount in millisatoshis
+/// * `zap_request` - Optional Nostr zap request event
+///
+/// # Returns
+/// A BOLT11 invoice if successful, or an error
+pub(crate) async fn get_invoice_impl(
+    state: &State,
+    ark_address: &str,
+    params: LnurlCallbackParams,
+) -> anyhow::Result<Bolt11Invoice> {
+    let ark_address = validate_ark_address(ark_address)?;
+    validate_callback_params(&params)?;
+
+    if params.amount.is_none() {
+        return Err(anyhow!("Missing amount parameter"));
+    }
+    let amount_msats = params.amount.unwrap();
+    validate_amount_msats(amount_msats, state.min_sendable, state.max_sendable)?;
+
+    let mut zap_request = None;
+    let _invoice_description = match params.nostr.as_ref() {
+        None => calc_metadata(&ark_address.to_string(), &state.domain),
+        Some(str) => {
+            let event = Event::from_json(str).map_err(|_| anyhow!("Invalid zap request"))?;
+            if event.kind != nostr::Kind::ZapRequest {
+                return Err(anyhow!("Invalid zap request"));
+            }
+            zap_request = Some(event);
+            str.clone()
+        }
+    };
+
+    let invoice = state
+        .barkd
+        .invoice_for_address(
+            amount_msats / 1_000,
+            ark_address.to_string(),
+            Some(_invoice_description),
+        )
+        .await?;
+
+    if !invoice
+        .amount_milli_satoshis()
+        .is_some_and(|a| a == amount_msats)
+    {
+        return Err(anyhow!("Invoice amount mismatch"));
+    }
+
+    let payment_hash = invoice.payment_hash().to_string();
+    let expires_at = invoice_expires_at(&invoice);
+
+    let mut conn = state.db_pool.get()?;
+    conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let invoice = NewInvoice {
+            ark_address: ark_address.to_string(),
+            bolt11: invoice.to_string(),
+            amount_msats: amount_msats as i64,
+            payment_hash: Some(payment_hash),
+            preimage: String::new(),
+            lnurlp_comment: params.comment,
+            state: InvoiceState::Pending as i32,
+            expires_at,
+        };
+        let inserted_invoice = invoice.insert(conn)?;
+
+        if let Some(zap_request) = zap_request {
+            let zap = Zap {
+                id: inserted_invoice.id,
+                request: zap_request.as_json(),
+                event_id: None,
+            };
+            zap.insert(conn)?;
+        }
+
+        Ok(())
+    })?;
+
+    Ok(invoice)
+}
+
+fn invoice_expires_at(invoice: &Bolt11Invoice) -> Option<NaiveDateTime> {
+    let expires_at = invoice.expires_at()?;
+    let expires_at = SystemTime::UNIX_EPOCH.checked_add(expires_at)?;
+    Some(DateTime::<Utc>::from(expires_at).naive_utc())
+}
+
+/// HTTP endpoint for generating Lightning invoices from a LNURL-pay request.
+///
+/// This route handles the callback phase of the LNURL-pay protocol.
+///
+/// # Parameters
+/// * `hash` - Path parameter containing the description hash
+/// * `params` - Query parameters including the amount and optional zap request
+/// * `state` - Application state
+///
+/// # Returns
+/// A JSON response with the invoice and verification URL, or an error response
+pub async fn get_invoice(
+    Path(ark_address): Path<String>,
+    Query(params): Query<LnurlCallbackParams>,
+    Extension(state): Extension<State>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let amount_msats = params.amount;
+
+    match get_invoice_impl(&state, &ark_address, params).await {
+        Ok(invoice) => {
+            let desc_hash = invoice_description_hash(&invoice);
+            let payment_hash = invoice.payment_hash().to_string();
+            let verify_url = format!("https://{}/verify/{desc_hash}/{payment_hash}", state.domain);
+            Ok(Json(json!({
+                "status": "OK",
+                "pr": invoice,
+                "verify": verify_url,
+                "routes": [],
+            })))
+        }
+        Err(e) => {
+            error!(
+                "Error generating invoice for ark_address={ark_address} amount_msats={amount_msats:?}: {e:#}"
+            );
+            Err(handle_anyhow_error(e))
+        }
+    }
+}
+
+pub fn calc_metadata(ark_address: &str, domain: &str) -> String {
+    format!(
+        "[[\"text/identifier\",\"{ark_address}@{domain}\"],[\"text/plain\",\"Sats for {ark_address}\"]]",
+    )
+}
+
+fn invoice_description_hash(invoice: &Bolt11Invoice) -> String {
+    match invoice.description() {
+        Bolt11InvoiceDescriptionRef::Direct(description) => {
+            sha256::Hash::hash(description.to_string().as_bytes()).to_string()
+        }
+        Bolt11InvoiceDescriptionRef::Hash(hash) => hex::encode(hash.0.to_byte_array()),
+    }
+}
+
+fn validate_amount_msats(
+    amount_msats: u64,
+    min_sendable: u64,
+    max_sendable: u64,
+) -> anyhow::Result<()> {
+    if amount_msats < min_sendable || amount_msats > max_sendable {
+        return Err(anyhow!("Amount out of bounds"));
+    }
+    if amount_msats % 1_000 != 0 {
+        return Err(anyhow!("Bark invoices must be denominated in whole sats"));
+    }
+
+    Ok(())
+}
+
+fn validate_callback_params(params: &LnurlCallbackParams) -> anyhow::Result<()> {
+    if params
+        .comment
+        .as_ref()
+        .is_some_and(|comment| comment.chars().count() > MAX_COMMENT_LEN)
+    {
+        return Err(anyhow!("Comment is too long"));
+    }
+
+    if params
+        .nostr
+        .as_ref()
+        .is_some_and(|nostr| nostr.len() > MAX_NOSTR_PARAM_LEN)
+    {
+        return Err(anyhow!("Nostr parameter is too large"));
+    }
+
+    Ok(())
+}
+
+fn validate_ark_address(ark_address: &str) -> anyhow::Result<ark::Address> {
+    if ark_address.is_empty() {
+        return Err(anyhow!("Ark address parameter is required"));
+    }
+
+    ark_address
+        .parse::<ark::Address>()
+        .map_err(|_| anyhow!("Invalid Ark address"))
+}
+
+/// HTTP endpoint that provides the LNURL-pay metadata and parameters.
+///
+/// This is the entry point for the LNURL-pay protocol, served at the
+/// .well-known/lnurlp/{ark_address} path.
+///
+/// # Parameters
+/// * `ark_address` - Path parameter containing the Ark address portion of the Lightning address
+/// * `state` - Application state with domain and configuration
+///
+/// # Returns
+/// A LNURL PayResponse with callback URL and other parameters, or an error response
+pub async fn get_lnurl_pay(
+    Path(ark_address): Path<String>,
+    Extension(state): Extension<State>,
+) -> Result<Json<PayResponse>, (StatusCode, Json<Value>)> {
+    let ark_address = match validate_ark_address(&ark_address) {
+        Ok(address) => address.to_string(),
+        Err(e) => {
+            return Err(handle_anyhow_error(e));
+        }
+    };
+
+    let metadata = calc_metadata(&ark_address, &state.domain);
+
+    let callback = format!("https://{}/get-invoice/{ark_address}", state.domain);
+
+    let resp = PayResponse {
+        callback,
+        min_sendable: state.min_sendable,
+        max_sendable: state.max_sendable,
+        tag: Tag::PayRequest,
+        metadata,
+        comment_allowed: Some(100),
+        allows_nostr: Some(true),
+        nostr_pubkey: Some(
+            state
+                .keys
+                .public_key()
+                .xonly()
+                .expect("cant get xonly pubkey"),
+        ),
+    };
+
+    Ok(Json(resp))
+}
+
+/// HTTP endpoint for verifying the status of a Lightning invoice payment.
+///
+/// This route is called by clients to check if an invoice has been paid.
+///
+/// # Parameters
+/// * `desc_hash` and `pay_hash` - Path parameters for the description hash and payment hash
+/// * `state` - Application state with LND client
+///
+/// # Returns
+/// A JSON response indicating settlement status and preimage (if settled), or an error response
+pub async fn verify(
+    Path((desc_hash, pay_hash)): Path<(String, String)>,
+    Extension(state): Extension<State>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    validate_hex_hash(&desc_hash, "Invalid description hash")?;
+    validate_hex_hash(&pay_hash, "Invalid payment hash")?;
+
+    let mut invoice = find_invoice_by_payment_hash(&state, &pay_hash)?;
+
+    if invoice.state == InvoiceState::Pending as i32 {
+        refresh_invoice_receive_status(&state, &invoice, &pay_hash).await?;
+        invoice = find_invoice_by_payment_hash(&state, &pay_hash)?;
+    }
+
+    let bolt11 = invoice.bolt11();
+    if !invoice_description_hash(&bolt11).eq_ignore_ascii_case(&desc_hash) {
+        return Ok(Json(not_found_response()));
+    }
+
+    if invoice.state == InvoiceState::Settled as i32 && !invoice.preimage.is_empty() {
+        Ok(Json(json!({
+            "status": "OK",
+            "settled": true,
+            "preimage": invoice.preimage,
+            "pr": bolt11,
+        })))
+    } else {
+        Ok(Json(json!({
+            "status": "OK",
+            "settled": false,
+            "preimage": null,
+            "pr": bolt11,
+        })))
+    }
+}
+
+fn validate_hex_hash(hash: &str, reason: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if hash.len() == 64 && hex::decode(hash).is_ok_and(|bytes| bytes.len() == 32) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "ERROR",
+                "reason": reason,
+            })),
+        ))
+    }
+}
+
+fn find_invoice_by_payment_hash(
+    state: &State,
+    payment_hash: &str,
+) -> Result<Invoice, (StatusCode, Json<Value>)> {
+    let mut conn = state.db_pool.get().map_err(|e| {
+        error!("DB connection error: {e}");
+        server_error_response()
+    })?;
+
+    Invoice::get_by_payment_hash(&mut conn, payment_hash)
+        .map_err(|e| {
+            error!("Error looking up invoice for payment_hash={payment_hash}: {e:?}");
+            server_error_response()
+        })?
+        .ok_or_else(|| (StatusCode::OK, Json(not_found_response())))
+}
+
+async fn refresh_invoice_receive_status(
+    state: &State,
+    invoice: &Invoice,
+    payment_hash: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let receive = state
+        .barkd
+        .receive_status(payment_hash)
+        .await
+        .map_err(|e| {
+            error!("Error refreshing receive status for payment_hash={payment_hash}: {e:#}");
+            server_error_response()
+        })?;
+
+    let mut conn = state.db_pool.get().map_err(|e| {
+        error!("DB connection error: {e}");
+        server_error_response()
+    })?;
+
+    if let Some(receive) = receive {
+        if receive.preimage_revealed_at.is_some() {
+            invoice
+                .mark_settled(&mut conn, receive.payment_preimage.to_string())
+                .map_err(|e| {
+                    error!("Error marking invoice settled for payment_hash={payment_hash}: {e:?}");
+                    server_error_response()
+                })?;
+        } else if receive.finished_at.is_some() {
+            invoice.mark_cancelled(&mut conn).map_err(|e| {
+                error!("Error marking invoice cancelled for payment_hash={payment_hash}: {e:?}");
+                server_error_response()
+            })?;
+        }
+    } else if invoice_has_expired(invoice) {
+        invoice.mark_cancelled(&mut conn).map_err(|e| {
+            error!(
+                "Error marking expired invoice cancelled for payment_hash={payment_hash}: {e:?}"
+            );
+            server_error_response()
+        })?;
+    }
+
+    Ok(())
+}
+
+fn invoice_has_expired(invoice: &Invoice) -> bool {
+    invoice
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= chrono::Utc::now().naive_utc())
+        || invoice.bolt11().is_expired()
+}
+
+fn not_found_response() -> Value {
+    json!({
+        "status": "ERROR",
+        "reason": "Not found",
+    })
+}
+
+fn server_error_response() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "status": "ERROR",
+            "reason": "Server error",
+        })),
+    )
+}
+
+/// Utility function for converting anyhow errors to HTTP response format.
+///
+/// # Parameters
+/// * `err` - The anyhow Error to convert
+///
+/// # Returns
+/// A tuple containing a 400 Bad Request status code and a JSON error response
+pub(crate) fn handle_anyhow_error(err: anyhow::Error) -> (StatusCode, Json<Value>) {
+    let err = json!({
+        "status": "ERROR",
+        "reason": format!("{err}"),
+    });
+    (StatusCode::BAD_REQUEST, Json(err))
+}
+
+/// Fallback route handler that returns a 404 Not Found response
+/// when a request is made to a non-existent route.
+///
+/// # Parameters
+/// * `uri` - The URI of the request
+///
+/// # Returns
+/// A 404 status code and a message indicating the route was not found
+pub async fn fallback(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("No route for {}", uri))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_matches_lnurl_identifier_format() {
+        assert_eq!(
+            calc_metadata("ark1example", "example.com"),
+            "[[\"text/identifier\",\"ark1example@example.com\"],[\"text/plain\",\"Sats for ark1example\"]]"
+        );
+    }
+
+    #[test]
+    fn amount_validation_accepts_whole_sats_within_bounds() {
+        validate_amount_msats(10_000, 1_000, 100_000).unwrap();
+    }
+
+    #[test]
+    fn amount_validation_rejects_out_of_bounds_amounts() {
+        assert_eq!(
+            validate_amount_msats(999, 1_000, 100_000)
+                .unwrap_err()
+                .to_string(),
+            "Amount out of bounds"
+        );
+        assert_eq!(
+            validate_amount_msats(101_000, 1_000, 100_000)
+                .unwrap_err()
+                .to_string(),
+            "Amount out of bounds"
+        );
+    }
+
+    #[test]
+    fn amount_validation_rejects_non_whole_sat_amounts() {
+        assert_eq!(
+            validate_amount_msats(1_001, 1_000, 100_000)
+                .unwrap_err()
+                .to_string(),
+            "Bark invoices must be denominated in whole sats"
+        );
+    }
+
+    #[test]
+    fn ark_address_validation_rejects_empty_or_invalid_addresses() {
+        assert_eq!(
+            validate_ark_address("").unwrap_err().to_string(),
+            "Ark address parameter is required"
+        );
+        assert_eq!(
+            validate_ark_address("not-an-ark-address")
+                .unwrap_err()
+                .to_string(),
+            "Invalid Ark address"
+        );
+    }
+
+    #[test]
+    fn callback_validation_rejects_oversized_inputs() {
+        let params = LnurlCallbackParams {
+            comment: Some("a".repeat(MAX_COMMENT_LEN + 1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_callback_params(&params).unwrap_err().to_string(),
+            "Comment is too long"
+        );
+
+        let params = LnurlCallbackParams {
+            nostr: Some("a".repeat(MAX_NOSTR_PARAM_LEN + 1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_callback_params(&params).unwrap_err().to_string(),
+            "Nostr parameter is too large"
+        );
+    }
+
+    #[test]
+    fn empty_callback_strings_deserialize_to_none() {
+        let params: LnurlCallbackParams = serde_json::from_value(json!({
+            "amount": 1_000,
+            "comment": "",
+            "nostr": ""
+        }))
+        .unwrap();
+
+        assert_eq!(params.amount, Some(1_000));
+        assert_eq!(params.comment, None);
+        assert_eq!(params.nostr, None);
+    }
+}
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+}
+
+impl HealthResponse {
+    /// Fabricate a status: pass response without checking database connectivity
+    pub fn new_ok() -> Self {
+        Self {
+            status: String::from("pass"),
+            version: String::from("0"),
+        }
+    }
+}
+
+/// IETF draft RFC for HTTP API Health Checks:
+/// https://datatracker.ietf.org/doc/html/draft-inadarei-api-health-check
+pub async fn health_check() -> Result<Json<HealthResponse>, (StatusCode, String)> {
+    Ok(Json(HealthResponse::new_ok()))
+}
+
+pub fn empty_string_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: Display,
+{
+    let opt = Option::<String>::deserialize(de)?;
+    match opt.as_deref() {
+        None | Some("") => Ok(None),
+        Some(s) => FromStr::from_str(s).map_err(de::Error::custom).map(Some),
+    }
+}
