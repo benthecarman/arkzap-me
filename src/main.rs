@@ -19,12 +19,15 @@ use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
+use crate::arkade::ArkadeClient;
 use crate::barkd::BarkdClient;
 use crate::config::*;
+use crate::models::arkade_invoice::ArkadeInvoice;
 use crate::models::invoice::{Invoice, InvoiceState};
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::routes::*;
 
+mod arkade;
 mod barkd;
 mod config;
 mod models;
@@ -38,6 +41,7 @@ pub struct State {
     pub db_pool: Pool<ConnectionManager<PgConnection>>,
     pub keys: Keys,
     pub barkd: Arc<BarkdClient>,
+    pub arkade: Arc<ArkadeClient>,
 
     // -- config options --
     pub domain: String,
@@ -65,6 +69,19 @@ async fn main() -> anyhow::Result<()> {
         config.barkd_url.clone(),
         config.barkd_token.clone(),
     )?);
+    let arkade = Arc::new(
+        ArkadeClient::new(
+            db_pool.clone(),
+            config.arkade_xpriv.clone(),
+            config.arkade_server_url.clone(),
+            config.arkade_boltz_url.clone(),
+            config.arkade_esplora_url.clone(),
+            config.network,
+            config.arkade_invoice_expiry_secs,
+            config.request_timeout_seconds,
+        )
+        .await?,
+    );
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit_per_minute));
     let request_timeout = Duration::from_secs(config.request_timeout_seconds);
     let max_request_body_bytes = config.max_request_body_bytes;
@@ -73,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool: db_pool.clone(),
         keys: keys.clone(),
         barkd,
+        arkade,
         domain: config.domain,
         min_sendable: config.min_sendable,
         max_sendable: config.max_sendable,
@@ -152,6 +170,11 @@ async fn claim_paid_invoices(state: State) {
 }
 
 async fn claim_paid_invoices_once(state: &State) -> anyhow::Result<()> {
+    claim_paid_bark_invoices_once(state).await?;
+    claim_paid_arkade_invoices_once(state).await
+}
+
+async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
     let invoices = {
         let mut conn = state.db_pool.get()?;
         Invoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
@@ -192,15 +215,90 @@ async fn claim_paid_invoices_once(state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn invoice_has_expired(invoice: &Invoice) -> bool {
+async fn claim_paid_arkade_invoices_once(state: &State) -> anyhow::Result<()> {
+    let invoices = {
+        let mut conn = state.db_pool.get()?;
+        ArkadeInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
+    };
+
+    for invoice in invoices {
+        let payment_hash = invoice_payment_hash(&invoice);
+        if invoice_has_expired(&invoice) {
+            let mut conn = state.db_pool.get()?;
+            if invoice.mark_cancelled(&mut conn)? {
+                info!(
+                    "Cancelled expired Arkade invoice {} payment_hash={} amount_msats={}",
+                    invoice.id, payment_hash, invoice.amount_msats
+                );
+            }
+            continue;
+        }
+
+        match state.arkade.claim_receive(&invoice.swap_id).await {
+            Ok(preimage) => {
+                let mut conn = state.db_pool.get()?;
+                if invoice.mark_settled(&mut conn, hex::encode(preimage))? {
+                    info!(
+                        "Claimed Arkade invoice {} payment_hash={} amount_msats={} swap_id={}",
+                        invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Unable to claim Arkade invoice {} payment_hash={} swap_id={}: {e:#}",
+                    invoice.id, payment_hash, invoice.swap_id
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+trait StoredInvoice {
+    fn expires_at(&self) -> Option<chrono::NaiveDateTime>;
+    fn bolt11(&self) -> lightning_invoice::Bolt11Invoice;
+    fn payment_hash(&self) -> Option<&str>;
+}
+
+impl StoredInvoice for Invoice {
+    fn expires_at(&self) -> Option<chrono::NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> lightning_invoice::Bolt11Invoice {
+        self.bolt11()
+    }
+
+    fn payment_hash(&self) -> Option<&str> {
+        self.payment_hash.as_deref()
+    }
+}
+
+impl StoredInvoice for ArkadeInvoice {
+    fn expires_at(&self) -> Option<chrono::NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> lightning_invoice::Bolt11Invoice {
+        self.bolt11()
+    }
+
+    fn payment_hash(&self) -> Option<&str> {
+        self.payment_hash.as_deref()
+    }
+}
+
+fn invoice_has_expired(invoice: &impl StoredInvoice) -> bool {
     invoice
-        .expires_at
+        .expires_at()
         .is_some_and(|expires_at| expires_at <= chrono::Utc::now().naive_utc())
         || invoice.bolt11().is_expired()
 }
 
-fn invoice_payment_hash(invoice: &Invoice) -> String {
-    match invoice.payment_hash.as_deref() {
+fn invoice_payment_hash(invoice: &impl StoredInvoice) -> String {
+    match invoice.payment_hash() {
         Some(payment_hash) => payment_hash.to_string(),
         None => invoice.bolt11().payment_hash().to_string(),
     }
@@ -383,6 +481,20 @@ mod db_tests {
         .get_result(&mut conn)?;
         assert_eq!(invoice_table_count.count, 1);
 
+        let arkade_invoice_table_count: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'arkade_invoice'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(arkade_invoice_table_count.count, 1);
+
+        let arkade_swap_storage_table_count: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'arkade_swap_storage'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(arkade_swap_storage_table_count.count, 1);
+
         let users_table_count: Count = diesel::sql_query(
             "SELECT COUNT(*) AS count FROM information_schema.tables \
              WHERE table_schema = current_schema() AND table_name = 'users'",
@@ -410,6 +522,30 @@ mod db_tests {
             assert!(
                 columns.iter().any(|column| column == expected),
                 "missing invoice.{expected} column"
+            );
+        }
+
+        let arkade_columns: Vec<ColumnName> = diesel::sql_query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'arkade_invoice'",
+        )
+        .load(&mut conn)?;
+        let arkade_columns = arkade_columns
+            .into_iter()
+            .map(|column| column.column_name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "recipient_address",
+            "payment_hash",
+            "swap_id",
+            "created_at",
+            "expires_at",
+            "settled_at",
+        ] {
+            assert!(
+                arkade_columns.iter().any(|column| column == expected),
+                "missing arkade_invoice.{expected} column"
             );
         }
 

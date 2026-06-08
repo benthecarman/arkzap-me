@@ -1,3 +1,5 @@
+use crate::models::arkade_invoice::{ArkadeInvoice, NewArkadeInvoice};
+use crate::models::arkade_zap::ArkadeZap;
 use crate::models::invoice::{Invoice, InvoiceState, NewInvoice};
 use crate::models::zap::Zap;
 use crate::State;
@@ -47,10 +49,10 @@ pub struct LnurlCallbackParams {
 /// A BOLT11 invoice if successful, or an error
 pub(crate) async fn get_invoice_impl(
     state: &State,
-    ark_address: &str,
+    address: &str,
     params: LnurlCallbackParams,
 ) -> anyhow::Result<Bolt11Invoice> {
-    let ark_address = validate_ark_address(ark_address)?;
+    let address = parse_receive_address(address)?;
     validate_callback_params(&params)?;
 
     if params.amount.is_none() {
@@ -61,7 +63,7 @@ pub(crate) async fn get_invoice_impl(
 
     let mut zap_request = None;
     let _invoice_description = match params.nostr.as_ref() {
-        None => calc_metadata(&ark_address.to_string(), &state.domain),
+        None => calc_metadata(&address.to_string(), &state.domain),
         Some(str) => {
             let event = Event::from_json(str).map_err(|_| anyhow!("Invalid zap request"))?;
             if event.kind != nostr::Kind::ZapRequest {
@@ -72,52 +74,130 @@ pub(crate) async fn get_invoice_impl(
         }
     };
 
-    let invoice = state
-        .barkd
-        .invoice_for_address(
-            amount_msats / 1_000,
-            ark_address.to_string(),
-            Some(_invoice_description),
-        )
-        .await?;
+    let invoice = match address {
+        ReceiveAddress::Bark(ark_address) => {
+            let invoice = state
+                .barkd
+                .invoice_for_address(
+                    amount_msats / 1_000,
+                    ark_address.to_string(),
+                    Some(_invoice_description),
+                )
+                .await?;
+            PendingInvoice::Bark {
+                invoice,
+                address: ark_address.to_string(),
+            }
+        }
+        ReceiveAddress::Arkade(arkade_address) => {
+            let result = state
+                .arkade
+                .invoice_for_address(
+                    amount_msats / 1_000,
+                    arkade_address,
+                    Some(_invoice_description),
+                )
+                .await?;
+            PendingInvoice::Arkade {
+                invoice: result.invoice,
+                address: arkade_address.to_string(),
+                swap_id: result.swap_id,
+            }
+        }
+    };
 
     if !invoice
+        .bolt11()
         .amount_milli_satoshis()
         .is_some_and(|a| a == amount_msats)
     {
         return Err(anyhow!("Invoice amount mismatch"));
     }
 
-    let payment_hash = invoice.payment_hash().to_string();
-    let expires_at = invoice_expires_at(&invoice);
+    let payment_hash = invoice.bolt11().payment_hash().to_string();
+    let expires_at = invoice_expires_at(invoice.bolt11());
+    let invoice_to_return = invoice.bolt11().clone();
 
     let mut conn = state.db_pool.get()?;
     conn.transaction::<_, anyhow::Error, _>(|conn| {
-        let invoice = NewInvoice {
-            ark_address: ark_address.to_string(),
-            bolt11: invoice.to_string(),
-            amount_msats: amount_msats as i64,
-            payment_hash: Some(payment_hash),
-            preimage: String::new(),
-            lnurlp_comment: params.comment,
-            state: InvoiceState::Pending as i32,
-            expires_at,
-        };
-        let inserted_invoice = invoice.insert(conn)?;
+        match invoice {
+            PendingInvoice::Bark { invoice, address } => {
+                let invoice = NewInvoice {
+                    ark_address: address,
+                    bolt11: invoice.to_string(),
+                    amount_msats: amount_msats as i64,
+                    payment_hash: Some(payment_hash),
+                    preimage: String::new(),
+                    lnurlp_comment: params.comment,
+                    state: InvoiceState::Pending as i32,
+                    expires_at,
+                };
+                let inserted_invoice = invoice.insert(conn)?;
 
-        if let Some(zap_request) = zap_request {
-            let zap = Zap {
-                id: inserted_invoice.id,
-                request: zap_request.as_json(),
-                event_id: None,
-            };
-            zap.insert(conn)?;
+                if let Some(zap_request) = zap_request {
+                    let zap = Zap {
+                        id: inserted_invoice.id,
+                        request: zap_request.as_json(),
+                        event_id: None,
+                    };
+                    zap.insert(conn)?;
+                }
+            }
+            PendingInvoice::Arkade {
+                invoice,
+                address,
+                swap_id,
+            } => {
+                let invoice = NewArkadeInvoice {
+                    recipient_address: address,
+                    bolt11: invoice.to_string(),
+                    amount_msats: amount_msats as i64,
+                    payment_hash: Some(payment_hash),
+                    preimage: String::new(),
+                    swap_id,
+                    lnurlp_comment: params.comment,
+                    state: InvoiceState::Pending as i32,
+                    expires_at,
+                };
+                let inserted_invoice = invoice.insert(conn)?;
+
+                if let Some(zap_request) = zap_request {
+                    let zap = ArkadeZap {
+                        id: inserted_invoice.id,
+                        request: zap_request.as_json(),
+                        event_id: None,
+                    };
+                    zap.insert(conn)?;
+                }
+            }
         }
 
         Ok(())
     })?;
 
-    Ok(invoice)
+    Ok(invoice_to_return)
+}
+
+enum PendingInvoice {
+    Bark {
+        invoice: Bolt11Invoice,
+        address: String,
+    },
+    Arkade {
+        invoice: Bolt11Invoice,
+        address: String,
+        swap_id: String,
+    },
+}
+
+impl PendingInvoice {
+    fn bolt11(&self) -> &Bolt11Invoice {
+        match self {
+            PendingInvoice::Bark { invoice, .. } | PendingInvoice::Arkade { invoice, .. } => {
+                invoice
+            }
+        }
+    }
 }
 
 fn invoice_expires_at(invoice: &Bolt11Invoice) -> Option<NaiveDateTime> {
@@ -215,14 +295,42 @@ fn validate_callback_params(params: &LnurlCallbackParams) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn validate_ark_address(ark_address: &str) -> anyhow::Result<ark::Address> {
-    if ark_address.is_empty() {
+enum ReceiveAddress {
+    Bark(ark::Address),
+    Arkade(ark_core::ArkAddress),
+}
+
+impl Display for ReceiveAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReceiveAddress::Bark(address) => write!(f, "{address}"),
+            ReceiveAddress::Arkade(address) => write!(f, "{address}"),
+        }
+    }
+}
+
+fn parse_receive_address(address: &str) -> anyhow::Result<ReceiveAddress> {
+    if address.is_empty() {
         return Err(anyhow!("Ark address parameter is required"));
     }
 
-    ark_address
-        .parse::<ark::Address>()
-        .map_err(|_| anyhow!("Invalid Ark address"))
+    if let Ok(address) = address.parse::<ark::Address>() {
+        return Ok(ReceiveAddress::Bark(address));
+    }
+
+    if let Ok(address) = address.parse::<ark_core::ArkAddress>() {
+        return Ok(ReceiveAddress::Arkade(address));
+    }
+
+    Err(anyhow!("Invalid Ark address"))
+}
+
+#[cfg(test)]
+fn validate_ark_address(ark_address: &str) -> anyhow::Result<ark::Address> {
+    match parse_receive_address(ark_address)? {
+        ReceiveAddress::Bark(address) => Ok(address),
+        ReceiveAddress::Arkade(_) => Err(anyhow!("Invalid Ark address")),
+    }
 }
 
 /// HTTP endpoint that provides the LNURL-pay metadata and parameters.
@@ -237,19 +345,19 @@ fn validate_ark_address(ark_address: &str) -> anyhow::Result<ark::Address> {
 /// # Returns
 /// A LNURL PayResponse with callback URL and other parameters, or an error response
 pub async fn get_lnurl_pay(
-    Path(ark_address): Path<String>,
+    Path(address): Path<String>,
     Extension(state): Extension<State>,
 ) -> Result<Json<PayResponse>, (StatusCode, Json<Value>)> {
-    let ark_address = match validate_ark_address(&ark_address) {
+    let address = match parse_receive_address(&address) {
         Ok(address) => address.to_string(),
         Err(e) => {
             return Err(handle_anyhow_error(e));
         }
     };
 
-    let metadata = calc_metadata(&ark_address, &state.domain);
+    let metadata = calc_metadata(&address, &state.domain);
 
-    let callback = format!("https://{}/get-invoice/{ark_address}", state.domain);
+    let callback = format!("https://{}/get-invoice/{address}", state.domain);
 
     let resp = PayResponse {
         callback,
@@ -290,7 +398,7 @@ pub async fn verify(
 
     let mut invoice = find_invoice_by_payment_hash(&state, &pay_hash)?;
 
-    if invoice.state == InvoiceState::Pending as i32 {
+    if invoice.state() == InvoiceState::Pending as i32 {
         refresh_invoice_receive_status(&state, &invoice, &pay_hash).await?;
         invoice = find_invoice_by_payment_hash(&state, &pay_hash)?;
     }
@@ -300,11 +408,11 @@ pub async fn verify(
         return Ok(Json(not_found_response()));
     }
 
-    if invoice.state == InvoiceState::Settled as i32 && !invoice.preimage.is_empty() {
+    if invoice.state() == InvoiceState::Settled as i32 && !invoice.preimage().is_empty() {
         Ok(Json(json!({
             "status": "OK",
             "settled": true,
-            "preimage": invoice.preimage,
+            "preimage": invoice.preimage(),
             "pr": bolt11,
         })))
     } else {
@@ -331,24 +439,78 @@ fn validate_hex_hash(hash: &str, reason: &str) -> Result<(), (StatusCode, Json<V
     }
 }
 
+enum FoundInvoice {
+    Bark(Invoice),
+    Arkade(ArkadeInvoice),
+}
+
+impl FoundInvoice {
+    fn state(&self) -> i32 {
+        match self {
+            FoundInvoice::Bark(invoice) => invoice.state,
+            FoundInvoice::Arkade(invoice) => invoice.state,
+        }
+    }
+
+    fn preimage(&self) -> &str {
+        match self {
+            FoundInvoice::Bark(invoice) => &invoice.preimage,
+            FoundInvoice::Arkade(invoice) => &invoice.preimage,
+        }
+    }
+
+    fn bolt11(&self) -> Bolt11Invoice {
+        match self {
+            FoundInvoice::Bark(invoice) => invoice.bolt11(),
+            FoundInvoice::Arkade(invoice) => invoice.bolt11(),
+        }
+    }
+}
+
 fn find_invoice_by_payment_hash(
     state: &State,
     payment_hash: &str,
-) -> Result<Invoice, (StatusCode, Json<Value>)> {
+) -> Result<FoundInvoice, (StatusCode, Json<Value>)> {
     let mut conn = state.db_pool.get().map_err(|e| {
         error!("DB connection error: {e}");
         server_error_response()
     })?;
 
-    Invoice::get_by_payment_hash(&mut conn, payment_hash)
-        .map_err(|e| {
-            error!("Error looking up invoice for payment_hash={payment_hash}: {e:?}");
+    if let Some(invoice) = Invoice::get_by_payment_hash(&mut conn, payment_hash).map_err(|e| {
+        error!("Error looking up invoice for payment_hash={payment_hash}: {e:?}");
+        server_error_response()
+    })? {
+        return Ok(FoundInvoice::Bark(invoice));
+    }
+
+    if let Some(invoice) =
+        ArkadeInvoice::get_by_payment_hash(&mut conn, payment_hash).map_err(|e| {
+            error!("Error looking up Arkade invoice for payment_hash={payment_hash}: {e:?}");
             server_error_response()
         })?
-        .ok_or_else(|| (StatusCode::OK, Json(not_found_response())))
+    {
+        return Ok(FoundInvoice::Arkade(invoice));
+    }
+
+    Err((StatusCode::OK, Json(not_found_response())))
 }
 
 async fn refresh_invoice_receive_status(
+    state: &State,
+    invoice: &FoundInvoice,
+    payment_hash: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match invoice {
+        FoundInvoice::Bark(invoice) => {
+            refresh_bark_invoice_receive_status(state, invoice, payment_hash).await
+        }
+        FoundInvoice::Arkade(invoice) => {
+            refresh_arkade_invoice_receive_status(state, invoice, payment_hash).await
+        }
+    }
+}
+
+async fn refresh_bark_invoice_receive_status(
     state: &State,
     invoice: &Invoice,
     payment_hash: &str,
@@ -393,9 +555,79 @@ async fn refresh_invoice_receive_status(
     Ok(())
 }
 
-fn invoice_has_expired(invoice: &Invoice) -> bool {
+async fn refresh_arkade_invoice_receive_status(
+    state: &State,
+    invoice: &ArkadeInvoice,
+    payment_hash: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if invoice_has_expired(invoice) {
+        let mut conn = state.db_pool.get().map_err(|e| {
+            error!("DB connection error: {e}");
+            server_error_response()
+        })?;
+        invoice.mark_cancelled(&mut conn).map_err(|e| {
+            error!(
+                "Error marking expired Arkade invoice cancelled for payment_hash={payment_hash}: {e:?}"
+            );
+            server_error_response()
+        })?;
+        return Ok(());
+    }
+
+    match state.arkade.claim_receive(&invoice.swap_id).await {
+        Ok(preimage) => {
+            let mut conn = state.db_pool.get().map_err(|e| {
+                error!("DB connection error: {e}");
+                server_error_response()
+            })?;
+            invoice
+                .mark_settled(&mut conn, hex::encode(preimage))
+                .map_err(|e| {
+                    error!(
+                        "Error marking Arkade invoice settled for payment_hash={payment_hash}: {e:?}"
+                    );
+                    server_error_response()
+                })?;
+        }
+        Err(e) => {
+            error!(
+                "Error refreshing Arkade receive status for payment_hash={payment_hash} swap_id={}: {e:#}",
+                invoice.swap_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+trait InvoiceExpiry {
+    fn expires_at(&self) -> Option<NaiveDateTime>;
+    fn bolt11(&self) -> Bolt11Invoice;
+}
+
+impl InvoiceExpiry for Invoice {
+    fn expires_at(&self) -> Option<NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> Bolt11Invoice {
+        self.bolt11()
+    }
+}
+
+impl InvoiceExpiry for ArkadeInvoice {
+    fn expires_at(&self) -> Option<NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> Bolt11Invoice {
+        self.bolt11()
+    }
+}
+
+fn invoice_has_expired(invoice: &impl InvoiceExpiry) -> bool {
     invoice
-        .expires_at
+        .expires_at()
         .is_some_and(|expires_at| expires_at <= chrono::Utc::now().naive_utc())
         || invoice.bolt11().is_expired()
 }
@@ -500,6 +732,13 @@ mod tests {
                 .to_string(),
             "Invalid Ark address"
         );
+    }
+
+    #[test]
+    fn receive_address_validation_accepts_arkade_addresses() {
+        let address = "tark1qqellv77udfmr20tun8dvju5vgudpf9vxe8jwhthrkn26fz96pawqfdy8nk05rsmrf8h94j26905e7n6sng8y059z8ykn2j5xcuw4xt846qj6x";
+        let parsed = parse_receive_address(address).unwrap();
+        assert_eq!(parsed.to_string(), address);
     }
 
     #[test]

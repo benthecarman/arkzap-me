@@ -1,3 +1,5 @@
+pub mod arkade_invoice;
+pub mod arkade_zap;
 pub mod invoice;
-mod schema;
+pub(crate) mod schema;
 pub mod zap;

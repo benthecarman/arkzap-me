@@ -56,4 +56,28 @@ pub struct Config {
     /// Bearer token for the barkd REST API
     #[clap(long, env = "LNURL_BARKD_TOKEN")]
     pub barkd_token: Option<String>,
+
+    /// BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs
+    #[clap(long, env = "LNURL_ARKADE_XPRIV")]
+    pub arkade_xpriv: String,
+
+    /// Arkade server URL used by the Arkade SDK
+    #[clap(long, env = "LNURL_ARKADE_SERVER_URL")]
+    pub arkade_server_url: String,
+
+    /// Boltz URL used by the Arkade SDK for Lightning receive swaps
+    #[clap(long, env = "LNURL_ARKADE_BOLTZ_URL")]
+    pub arkade_boltz_url: String,
+
+    /// Esplora URL used by the Arkade SDK wallet implementation
+    #[clap(
+        default_value_t = String::from("https://mempool.space/api"),
+        long,
+        env = "LNURL_ARKADE_ESPLORA_URL"
+    )]
+    pub arkade_esplora_url: String,
+
+    /// Optional Arkade-generated BOLT11 invoice expiry in seconds
+    #[clap(long, env = "LNURL_ARKADE_INVOICE_EXPIRY_SECS")]
+    pub arkade_invoice_expiry_secs: Option<u64>,
 }

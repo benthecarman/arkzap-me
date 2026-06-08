@@ -40,6 +40,11 @@ local `.env` file on startup.
 | `LNURL_NSEC` | yes | | Nostr secret key used for zap support |
 | `LNURL_BARKD_URL` | yes | | Base URL for the `barkd` REST API |
 | `LNURL_BARKD_TOKEN` | no | | Bearer token for the `barkd` REST API |
+| `LNURL_ARKADE_XPRIV` | yes | | BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs |
+| `LNURL_ARKADE_SERVER_URL` | yes | | Arkade server URL used by the Arkade SDK |
+| `LNURL_ARKADE_BOLTZ_URL` | yes | | Boltz URL used by the Arkade SDK |
+| `LNURL_ARKADE_ESPLORA_URL` | no | `https://mempool.space/api` | Esplora URL used by the Arkade SDK wallet implementation |
+| `LNURL_ARKADE_INVOICE_EXPIRY_SECS` | no | | Optional Arkade-generated invoice expiry in seconds |
 | `LNURL_BIND` | no | `0.0.0.0` | HTTP bind address |
 | `LNURL_PORT` | no | `3000` | HTTP port |
 | `LNURL_NETWORK` | no | `bitcoin` | Bitcoin network |
@@ -54,6 +59,10 @@ LNURL_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/lnurl_bark
 LNURL_NSEC=nsec...
 LNURL_BARKD_URL=http://127.0.0.1:3535
 LNURL_BARKD_TOKEN=
+LNURL_ARKADE_XPRIV=xprv...
+LNURL_ARKADE_SERVER_URL=http://127.0.0.1:7070
+LNURL_ARKADE_BOLTZ_URL=http://127.0.0.1:9001
+LNURL_ARKADE_ESPLORA_URL=http://127.0.0.1:3002
 LNURL_DOMAIN=example.com
 LNURL_PORT=3000
 ```
@@ -110,7 +119,7 @@ Returns a simple health response:
 }
 ```
 
-Any valid Ark address can receive payments at the Lightning address
+Any valid Bark or Arkade address can receive payments at the Lightning address
 `<ark_address>@example.com` when `LNURL_DOMAIN=example.com`.
 
 ### LNURL-Pay Metadata
@@ -120,7 +129,7 @@ GET /.well-known/lnurlp/ark...
 ```
 
 Returns the LNURL-pay callback, amount limits, metadata, and Nostr zap support
-information for the Ark address.
+information for the Bark or Arkade address.
 
 ### Generate Invoice
 
