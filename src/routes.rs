@@ -304,14 +304,16 @@ pub(crate) async fn get_invoice_impl(
     address: &str,
     params: LnurlCallbackParams,
 ) -> anyhow::Result<Bolt11Invoice> {
-    let address = parse_receive_address(address)?;
-    address.validate_network(state.network)?;
-    address.validate_enabled(state)?;
     validate_callback_params(&params)?;
 
     if params.amount.is_none() {
         return Err(anyhow!("Missing amount parameter"));
     }
+
+    let address = parse_receive_address(address)?;
+    address.validate_network(state.network)?;
+    address.validate_enabled(state)?;
+
     let amount_msats = params.amount.unwrap();
     validate_amount_msats(
         amount_msats,
@@ -484,9 +486,6 @@ pub async fn get_invoice(
     Extension(state): Extension<State>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let amount_msats = params.amount;
-    let address_kind = parse_receive_address(&ark_address)
-        .map(|address| address.kind())
-        .unwrap_or("invalid");
 
     match get_invoice_impl(&state, &ark_address, params).await {
         Ok(invoice) => {
@@ -504,6 +503,9 @@ pub async fn get_invoice(
         }
         Err(e) => {
             if should_log_invoice_error(&e) {
+                let address_kind = parse_receive_address(&ark_address)
+                    .map(|address| address.kind())
+                    .unwrap_or("invalid");
                 error!(
                     "Error generating invoice for ark_address={ark_address} address_kind={address_kind} amount_msats={amount_msats:?}: {e:#}"
                 );
