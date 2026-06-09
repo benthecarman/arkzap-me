@@ -503,9 +503,11 @@ pub async fn get_invoice(
             })))
         }
         Err(e) => {
-            error!(
-                "Error generating invoice for ark_address={ark_address} address_kind={address_kind} amount_msats={amount_msats:?}: {e:#}"
-            );
+            if should_log_invoice_error(&e) {
+                error!(
+                    "Error generating invoice for ark_address={ark_address} address_kind={address_kind} amount_msats={amount_msats:?}: {e:#}"
+                );
+            }
             Err(handle_anyhow_error(e))
         }
     }
@@ -542,6 +544,11 @@ fn validate_callback_params(params: &LnurlCallbackParams) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+fn should_log_invoice_error(err: &anyhow::Error) -> bool {
+    !err.chain()
+        .any(|cause| cause.to_string() == "Missing amount parameter")
 }
 
 enum ReceiveAddress {
@@ -1133,6 +1140,20 @@ mod tests {
             validate_callback_params(&params).unwrap_err().to_string(),
             "Nostr parameter is too large"
         );
+    }
+
+    #[test]
+    fn missing_amount_errors_are_not_logged() {
+        let err = anyhow!("Missing amount parameter");
+
+        assert!(!should_log_invoice_error(&err));
+    }
+
+    #[test]
+    fn invoice_generation_errors_are_logged() {
+        let err = anyhow!("failed to generate barkd invoice for Ark address");
+
+        assert!(should_log_invoice_error(&err));
     }
 
     #[test]
