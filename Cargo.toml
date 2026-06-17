@@ -15,9 +15,9 @@ path = "src/main.rs"
 [dependencies]
 ark-lib = { git = "https://gitlab.com/benthecarman/bark.git", rev = "276da0603372f8d5704cd2dcfd757af727d3b400" }
 bark-rest-client = { git = "https://gitlab.com/benthecarman/bark.git", rev = "276da0603372f8d5704cd2dcfd757af727d3b400" }
-ark-bdk-wallet = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }
-ark-client = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }
-ark-core = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }
+ark-bdk-wallet = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
+ark-client = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
+ark-core = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
 
 anyhow = "1.0"
 async-trait = "0.1"
