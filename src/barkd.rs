@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Context};
+use ark::bitcoin::secp256k1::schnorr;
 use bark_rest_client::apis::configuration::Configuration;
 use bark_rest_client::apis::{lightning_api, wallet_api};
-use bark_rest_client::models::{
-    AddressVerifyMessageRequest, LightningInvoiceForAddressRequest, LightningReceiveInfo,
-};
+use bark_rest_client::models::{LightningInvoiceForAddressRequest, LightningReceiveInfo};
 use lightning_invoice::Bolt11Invoice;
 use std::fmt;
 use std::str::FromStr;
@@ -67,19 +66,15 @@ impl BarkdClient {
         message: String,
         signature: String,
     ) -> anyhow::Result<bool> {
-        let response = wallet_api::verify_address_message(
-            &self.config,
-            AddressVerifyMessageRequest {
-                address,
-                message,
-                signature,
-            },
-        )
-        .await
-        .map_err(barkd_error)
-        .context("failed to verify Bark address message")?;
+        let address = address
+            .parse::<ark::Address>()
+            .context("invalid Ark address")?;
+        let signature =
+            schnorr::Signature::from_str(&signature).context("invalid Schnorr signature")?;
 
-        Ok(response.valid)
+        Ok(address
+            .verify_message(message.as_bytes(), &signature)
+            .is_ok())
     }
 
     pub async fn receive_status(

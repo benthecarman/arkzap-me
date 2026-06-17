@@ -531,12 +531,24 @@ fn cancel_custom_address_invoice_if_expired(
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use crate::models::custom_address::CustomAddressInvoice;
     use crate::models::invoice::NewInvoice;
+    use ark::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    use ark::mailbox::MailboxIdentifier;
+    use axum::routing::{get, post};
+    use axum::{Extension, Json, Router};
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1 as BitcoinSecp256k1, SecretKey as BitcoinSecretKey};
     use chrono::Duration as ChronoDuration;
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Text};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use serde_json::{json, Value};
     use std::env;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
 
     struct TestSchema {
         database_url: String,
@@ -577,6 +589,20 @@ mod db_tests {
         fn set_search_path(&self, conn: &mut PgConnection) -> anyhow::Result<()> {
             conn.batch_execute(&format!(r#"SET search_path TO "{}";"#, self.schema))?;
             Ok(())
+        }
+
+        fn pool(&self) -> anyhow::Result<Pool<ConnectionManager<PgConnection>>> {
+            let separator = if self.database_url.contains('?') {
+                "&"
+            } else {
+                "?"
+            };
+            let database_url = format!(
+                "{}{}options=-csearch_path%3D{}",
+                self.database_url, separator, self.schema
+            );
+            let manager = ConnectionManager::<PgConnection>::new(database_url);
+            Ok(Pool::builder().max_size(4).build(manager)?)
         }
     }
 
@@ -786,5 +812,260 @@ mod db_tests {
         assert!(active_invoice.settled_at.is_some());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_address_sign_message_flow_creates_invoice() -> anyhow::Result<()> {
+        let Some((schema, _conn)) = TestSchema::new("custom_address_sign_message")? else {
+            return Ok(());
+        };
+
+        let db_pool = schema.pool()?;
+        run_migrations(&db_pool)?;
+
+        let (ark_address, vtxo_key) = test_bark_address()?;
+        let ark_address = ark_address.to_string();
+        let fee_receive_address = ark_address.clone();
+        let invoice = test_invoice(50_000);
+        let barkd = MockBarkd::start(MockBarkdState {
+            expected_fee_receive_address: fee_receive_address.to_string(),
+            expected_amount_sat: 50,
+            invoice: invoice.to_string(),
+            invoice_description: None,
+        })
+        .await?;
+
+        let state = State {
+            db_pool: db_pool.clone(),
+            keys: Keys::generate(),
+            barkd: Arc::new(BarkdClient::new(barkd.base_url(), None)?),
+            arkade: None,
+            domain: "example.com".to_string(),
+            network: bitcoin::Network::Bitcoin,
+            min_sendable: 1_000,
+            max_sendable: 1_000_000,
+            custom_address_fee_sats: 50,
+        };
+        let app = Router::new()
+            .route(
+                "/custom-addresses/auth-message",
+                get(custom_address_auth_message),
+            )
+            .route("/custom-addresses", post(create_custom_address_invoice))
+            .layer(Extension(state));
+        let app = TestServer::start(app).await?;
+        let client = reqwest::Client::new();
+
+        let auth: Value = client
+            .get(format!(
+                "{}/custom-addresses/auth-message?name=Alice&arkAddress={}",
+                app.base_url(),
+                ark_address
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let auth_message = auth["message"].as_str().unwrap().to_string();
+        assert_eq!(auth["name"], "alice");
+        assert_eq!(auth["arkAddress"], ark_address);
+        assert_eq!(
+            auth_message,
+            format!("arkzap.me custom address\nname: alice\ndomain: example.com\nark_address: {ark_address}")
+        );
+        let signature = ark_address
+            .parse::<ark::Address>()?
+            .sign_message(auth_message.as_bytes(), &vtxo_key)?
+            .to_string();
+
+        let created_response = client
+            .post(format!("{}/custom-addresses", app.base_url()))
+            .json(&json!({
+                "name": "Alice",
+                "arkAddress": ark_address,
+                "signature": signature,
+            }))
+            .send()
+            .await?;
+        let status = created_response.status();
+        let created: Value = created_response.json().await?;
+
+        assert_eq!(status, reqwest::StatusCode::OK, "{created}");
+
+        assert_eq!(created["status"], "OK");
+        assert_eq!(created["customAddress"], "alice@example.com");
+        assert_eq!(created["invoice"]["name"], "alice");
+        assert_eq!(created["invoice"]["arkAddress"], ark_address);
+        assert_eq!(created["invoice"]["invoice"], invoice.to_string());
+        assert_eq!(created["invoice"]["state"], "pending");
+        assert_eq!(created["invoice"]["active"], false);
+
+        let mut conn = db_pool.get()?;
+        let invoices = CustomAddressInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?;
+        assert_eq!(invoices.len(), 1);
+        assert_eq!(invoices[0].name, "alice");
+        assert_eq!(invoices[0].ark_address, ark_address);
+        assert_eq!(invoices[0].auth_message, auth_message);
+        assert_eq!(invoices[0].signature, signature);
+        assert_eq!(invoices[0].fee_receive_address, fee_receive_address);
+        assert_eq!(invoices[0].amount_msats, 50_000);
+        assert_eq!(
+            invoices[0].payment_hash.as_deref(),
+            Some(invoice.payment_hash().to_string().as_str())
+        );
+
+        let mock_state = barkd.state.lock().unwrap();
+        assert_eq!(
+            mock_state.invoice_description.as_deref(),
+            Some("arkzap.me custom address alice")
+        );
+
+        Ok(())
+    }
+
+    struct MockBarkdState {
+        expected_fee_receive_address: String,
+        expected_amount_sat: u64,
+        invoice: String,
+        invoice_description: Option<String>,
+    }
+
+    struct MockBarkd {
+        addr: SocketAddr,
+        state: Arc<Mutex<MockBarkdState>>,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl MockBarkd {
+        async fn start(state: MockBarkdState) -> anyhow::Result<Self> {
+            let state = Arc::new(Mutex::new(state));
+            let app = Router::new()
+                .route("/api/v1/wallet/addresses/next", post(mock_new_address))
+                .route(
+                    "/api/v1/lightning/receives/invoice/for-address",
+                    post(mock_invoice_for_address),
+                )
+                .with_state(state.clone());
+            let (addr, shutdown) = spawn_router(app).await?;
+
+            Ok(Self {
+                addr,
+                state,
+                shutdown: Some(shutdown),
+            })
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for MockBarkd {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    struct TestServer {
+        addr: SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl TestServer {
+        async fn start(app: Router) -> anyhow::Result<Self> {
+            let (addr, shutdown) = spawn_router(app).await?;
+            Ok(Self {
+                addr,
+                shutdown: Some(shutdown),
+            })
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    async fn spawn_router(app: Router) -> anyhow::Result<(SocketAddr, oneshot::Sender<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        Ok((addr, shutdown_tx))
+    }
+
+    async fn mock_new_address(
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<MockBarkdState>>>,
+    ) -> Json<Value> {
+        let state = state.lock().unwrap();
+        Json(json!({ "address": state.expected_fee_receive_address }))
+    }
+
+    async fn mock_invoice_for_address(
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<MockBarkdState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let mut state = state.lock().unwrap();
+        assert_eq!(body["amount_sat"], state.expected_amount_sat);
+        assert_eq!(body["address"], state.expected_fee_receive_address);
+        state.invoice_description = body["description"].as_str().map(str::to_string);
+        Json(json!({ "invoice": state.invoice }))
+    }
+
+    fn test_invoice(amount_msats: u64) -> lightning_invoice::Bolt11Invoice {
+        let private_key = BitcoinSecretKey::from_slice(&[42; 32]).unwrap();
+        let payment_hash = sha256::Hash::from_slice(&[7; 32]).unwrap();
+        let payment_secret = PaymentSecret([9; 32]);
+
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .amount_milli_satoshis(amount_msats)
+            .description("custom address fee".to_string())
+            .payment_hash(payment_hash)
+            .payment_secret(payment_secret)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|hash| BitcoinSecp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+            .unwrap()
+    }
+
+    fn test_bark_address() -> anyhow::Result<(ark::Address, Keypair)> {
+        let secp = Secp256k1::new();
+        let server_key = test_keypair(&secp, 1)?;
+        let vtxo_key = test_keypair(&secp, 2)?;
+        let server_mailbox_key = test_keypair(&secp, 3)?;
+        let bark_mailbox_key = test_keypair(&secp, 4)?;
+        let mailbox = MailboxIdentifier::from_pubkey(bark_mailbox_key.public_key());
+
+        let address = ark::Address::builder()
+            .server_pubkey(server_key.public_key())
+            .pubkey_policy(vtxo_key.public_key())
+            .mailbox(server_mailbox_key.public_key(), mailbox, &vtxo_key)?
+            .into_address()?;
+
+        Ok((address, vtxo_key))
+    }
+
+    fn test_keypair<C: ark::bitcoin::secp256k1::Signing>(
+        secp: &Secp256k1<C>,
+        byte: u8,
+    ) -> anyhow::Result<Keypair> {
+        let secret_key = SecretKey::from_slice(&[byte; 32])?;
+        Ok(Keypair::from_secret_key(secp, &secret_key))
     }
 }
