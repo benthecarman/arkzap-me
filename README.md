@@ -9,7 +9,11 @@ For Bark addresses, the service asks `barkd` to generate invoices and checks
 receive-for-user flow to create reverse-swap invoices and claim the resulting
 VHTLC output to the recipient Arkade address.
 
-Invoices, SDK swap state, and optional Nostr zap requests are persisted in
+Users can also buy custom Lightning address names backed by their Bark Ark
+address. Ownership is authenticated with Bark address message signatures, and
+each name activates after its fee invoice is paid to the service Bark wallet.
+
+Invoices, custom names, SDK swap state, and optional Nostr zap requests are persisted in
 Postgres.
 
 ## Features
@@ -17,6 +21,7 @@ Postgres.
 - LNURL-pay metadata at `/.well-known/lnurlp/:address`
 - Invoice generation at `/get-invoice/:address`
 - Bark address support through `barkd`
+- Paid custom Lightning address names for Bark addresses
 - Arkade address support through the Arkade SDK receive-for-user branch
 - Optional Nostr zap request storage
 - Postgres persistence through Diesel migrations
@@ -61,6 +66,7 @@ local `.env` file on startup.
 | `LNURL_NETWORK` | no | `bitcoin` | Bitcoin network |
 | `LNURL_MIN_SENDABLE` | no | `1000` | Minimum LNURL amount in millisatoshis |
 | `LNURL_MAX_SENDABLE` | no | `11000000000` | Maximum LNURL amount in millisatoshis |
+| `LNURL_CUSTOM_ADDRESS_FEE_SATS` | no | `10000` | Fee charged to activate each custom Lightning address name |
 | `LNURL_DOMAIN` | no | `localhost:3000` | Public domain used in LNURL callbacks and Lightning addresses |
 
 Arkade addresses require a minimum amount of `333000` millisatoshis.
@@ -178,6 +184,42 @@ Optional query parameters:
 
 Successful responses include a BOLT11 invoice in the `pr` field and a `verify`
 URL for checking settlement status.
+
+### Custom Lightning Addresses
+
+Custom names map a short local-part like `alice` to a Bark Ark address. Names are
+3 to 32 characters and may contain lowercase letters, numbers, hyphens, and
+underscores. Arkade addresses are not supported for custom names.
+
+Get the message that must be signed by the Bark address owner:
+
+```http
+GET /custom-addresses/auth-message?name=alice&arkAddress=ark...
+```
+
+Create the fee invoice by submitting the Bark address signature:
+
+```http
+POST /custom-addresses
+Content-Type: application/json
+
+{
+  "name": "alice",
+  "arkAddress": "ark...",
+  "signature": "..."
+}
+```
+
+The response includes the BOLT11 fee invoice and a purchase `id`. Poll the
+purchase until it is active:
+
+```http
+GET /custom-addresses/:id
+```
+
+Once active, `<name>@example.com` works through the normal LNURL-pay and verify
+endpoints for life. The same Bark address can sign a new message and pay another
+fee to claim another available name.
 
 ### Verify Invoice
 

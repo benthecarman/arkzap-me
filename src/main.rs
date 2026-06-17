@@ -23,6 +23,7 @@ use crate::arkade::ArkadeClient;
 use crate::barkd::BarkdClient;
 use crate::config::*;
 use crate::models::arkade_invoice::ArkadeInvoice;
+use crate::models::custom_address::CustomAddressInvoice;
 use crate::models::invoice::{Invoice, InvoiceState};
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::routes::*;
@@ -48,6 +49,7 @@ pub struct State {
     pub network: bitcoin::Network,
     pub min_sendable: u64,
     pub max_sendable: u64,
+    pub custom_address_fee_sats: u64,
 }
 
 #[tokio::main]
@@ -107,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         network: config.network,
         min_sendable: config.min_sendable,
         max_sendable: config.max_sendable,
+        custom_address_fee_sats: config.custom_address_fee_sats,
     };
 
     tokio::spawn(claim_paid_invoices(state.clone()));
@@ -123,6 +126,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/get-invoice/:ark_address", get(get_invoice))
         .route("/verify/:address/:pay_hash", get(verify))
         .route("/.well-known/lnurlp/:ark_address", get(get_lnurl_pay))
+        .route(
+            "/custom-addresses/auth-message",
+            get(custom_address_auth_message),
+        )
+        .route(
+            "/custom-addresses",
+            axum::routing::post(create_custom_address_invoice),
+        )
+        .route("/custom-addresses/:id", get(get_custom_address_invoice))
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(middleware::from_fn_with_state(
@@ -192,6 +204,8 @@ async fn claim_paid_invoices_once(state: &State) -> anyhow::Result<()> {
 }
 
 async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
+    claim_paid_custom_address_invoices_once(state).await?;
+
     let invoices = {
         let mut conn = state.db_pool.get()?;
         Invoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
@@ -226,6 +240,22 @@ async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
 
         if let Err(e) = claim_invoice_if_paid(state, invoice, payment_hash).await {
             error!("Unable to claim invoice: {e:#}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn claim_paid_custom_address_invoices_once(state: &State) -> anyhow::Result<()> {
+    let invoices = {
+        let mut conn = state.db_pool.get()?;
+        CustomAddressInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
+    };
+
+    for invoice in invoices {
+        let payment_hash = invoice_payment_hash(&invoice);
+        if let Err(e) = claim_custom_address_invoice_if_paid(state, invoice, payment_hash).await {
+            error!("Unable to claim custom address invoice: {e:#}");
         }
     }
 
@@ -298,6 +328,20 @@ impl StoredInvoice for Invoice {
 }
 
 impl StoredInvoice for ArkadeInvoice {
+    fn expires_at(&self) -> Option<chrono::NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> lightning_invoice::Bolt11Invoice {
+        self.bolt11()
+    }
+
+    fn payment_hash(&self) -> Option<&str> {
+        self.payment_hash.as_deref()
+    }
+}
+
+impl StoredInvoice for CustomAddressInvoice {
     fn expires_at(&self) -> Option<chrono::NaiveDateTime> {
         self.expires_at
     }
@@ -411,6 +455,71 @@ fn cancel_invoice_if_expired(
     Ok(())
 }
 
+async fn claim_custom_address_invoice_if_paid(
+    state: &State,
+    invoice: CustomAddressInvoice,
+    payment_hash: String,
+) -> anyhow::Result<()> {
+    let receive = state
+        .barkd
+        .receive_status(&payment_hash)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to get lightning receive status for custom address invoice {}",
+                invoice.id
+            )
+        })?;
+
+    let Some(receive) = receive else {
+        cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
+        return Ok(());
+    };
+
+    if receive.preimage_revealed_at.is_some() {
+        let mut conn = state.db_pool.get()?;
+        if invoice.mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())? {
+            info!(
+                "Activated custom address {} for {} from invoice {} payment_hash={}",
+                invoice.name, invoice.ark_address, invoice.id, payment_hash
+            );
+        }
+        return Ok(());
+    }
+
+    if receive.finished_at.is_some() {
+        let mut conn = state.db_pool.get()?;
+        if invoice.mark_cancelled(&mut conn)? {
+            info!(
+                "Cancelled terminal unpaid custom address invoice {} payment_hash={}",
+                invoice.id, payment_hash
+            );
+        }
+    }
+
+    cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
+
+    Ok(())
+}
+
+fn cancel_custom_address_invoice_if_expired(
+    state: &State,
+    invoice: &CustomAddressInvoice,
+    payment_hash: &str,
+) -> anyhow::Result<()> {
+    if invoice_has_expired(invoice) {
+        let mut conn = state.db_pool.get()?;
+        if invoice.mark_cancelled(&mut conn)? {
+            info!(
+                "Cancelled expired custom address invoice {} payment_hash={} amount_msats={}",
+                invoice.id, payment_hash, invoice.amount_msats
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod db_tests {
     use super::*;
@@ -516,6 +625,20 @@ mod db_tests {
         .get_result(&mut conn)?;
         assert_eq!(arkade_swap_storage_table_count.count, 1);
 
+        let custom_addresses_table_count: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'custom_addresses'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(custom_addresses_table_count.count, 1);
+
+        let custom_address_invoice_table_count: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'custom_address_invoice'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(custom_address_invoice_table_count.count, 1);
+
         let users_table_count: Count = diesel::sql_query(
             "SELECT COUNT(*) AS count FROM information_schema.tables \
              WHERE table_schema = current_schema() AND table_name = 'users'",
@@ -543,6 +666,31 @@ mod db_tests {
             assert!(
                 columns.iter().any(|column| column == expected),
                 "missing invoice.{expected} column"
+            );
+        }
+
+        let custom_invoice_columns: Vec<ColumnName> = diesel::sql_query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'custom_address_invoice'",
+        )
+        .load(&mut conn)?;
+        let custom_invoice_columns = custom_invoice_columns
+            .into_iter()
+            .map(|column| column.column_name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "name",
+            "ark_address",
+            "fee_receive_address",
+            "payment_hash",
+            "settled_at",
+        ] {
+            assert!(
+                custom_invoice_columns
+                    .iter()
+                    .any(|column| column == expected),
+                "missing custom_address_invoice.{expected} column"
             );
         }
 

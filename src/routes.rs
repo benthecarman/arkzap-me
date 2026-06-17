@@ -1,5 +1,6 @@
 use crate::models::arkade_invoice::{ArkadeInvoice, NewArkadeInvoice};
 use crate::models::arkade_zap::ArkadeZap;
+use crate::models::custom_address::{CustomAddress, CustomAddressInvoice, NewCustomAddressInvoice};
 use crate::models::invoice::{Invoice, InvoiceState, NewInvoice};
 use crate::models::zap::Zap;
 use crate::State;
@@ -24,6 +25,7 @@ use std::time::SystemTime;
 
 const MAX_NOSTR_PARAM_LEN: usize = 16 * 1024;
 const ARKADE_MIN_SENDABLE_MSATS: u64 = 333_000;
+const MAX_CUSTOM_SIGNATURE_LEN: usize = 128;
 
 pub async fn root() -> Html<&'static str> {
     Html(concat!(
@@ -245,7 +247,7 @@ pub async fn root() -> Html<&'static str> {
     <div class="hero">
       <div>
         <h1>arkzap.me</h1>
-        <p class="lede">LNURL-pay infrastructure for sending Lightning zaps to Bark and Arkade receive addresses.</p>
+        <p class="lede">LNURL-pay infrastructure for sending Lightning zaps to Bark and custom Bark-backed Lightning addresses.</p>
         <div class="address">address@arkzap.me</div>
       </div>
       <div class="mark" aria-hidden="true"><div class="bolt"></div></div>
@@ -254,7 +256,7 @@ pub async fn root() -> Html<&'static str> {
     <section>
       <h2>What It Does</h2>
       <div class="grid">
-        <div class="item"><strong>LNURL-pay</strong><span>Publishes pay metadata for Bark and Arkade receive addresses.</span></div>
+        <div class="item"><strong>LNURL-pay</strong><span>Publishes pay metadata for Bark, Arkade, and paid custom names.</span></div>
         <div class="item"><strong>Nostr zaps</strong><span>Accepts zap request events and stores invoice verification data.</span></div>
         <div class="item"><strong>Settlement checks</strong><span>Exposes verification for pending and settled invoices.</span></div>
       </div>
@@ -266,6 +268,9 @@ pub async fn root() -> Html<&'static str> {
         <li><span class="method">GET</span><code>/.well-known/lnurlp/:address</code></li>
         <li><span class="method">GET</span><code>/get-invoice/:address?amount=1000</code></li>
         <li><span class="method">GET</span><code>/verify/:address/:payment_hash</code></li>
+        <li><span class="method">GET</span><code>/custom-addresses/auth-message?name=alice&amp;arkAddress=ark...</code></li>
+        <li><span class="method">POST</span><code>/custom-addresses</code></li>
+        <li><span class="method">GET</span><code>/custom-addresses/:id</code></li>
         <li><span class="method">GET</span><code>/health-check</code></li>
       </ul>
     </section>
@@ -310,9 +315,9 @@ pub(crate) async fn get_invoice_impl(
         return Err(anyhow!("Missing amount parameter"));
     }
 
-    let address = parse_receive_address(address)?;
-    address.validate_network(state.network)?;
-    address.validate_enabled(state)?;
+    let resolved_address = resolve_receive_address(state, address)?;
+    let invoice_identifier = resolved_address.identifier.clone();
+    let address = resolved_address.address;
 
     let amount_msats = params.amount.unwrap();
     validate_amount_msats(
@@ -323,7 +328,7 @@ pub(crate) async fn get_invoice_impl(
 
     let mut zap_request = None;
     let _invoice_description = match params.nostr.as_ref() {
-        None => calc_metadata(&address.to_string(), &state.domain),
+        None => calc_metadata(&invoice_identifier, &state.domain),
         Some(str) => {
             let event = Event::from_json(str).map_err(|_| anyhow!("Invalid zap request"))?;
             if event.kind != nostr::Kind::ZapRequest {
@@ -553,6 +558,11 @@ fn should_log_invoice_error(err: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string() == "Missing amount parameter")
 }
 
+struct ResolvedReceiveAddress {
+    address: ReceiveAddress,
+    identifier: String,
+}
+
 enum ReceiveAddress {
     Bark(ark::Address),
     Arkade(ark_core::ArkAddress),
@@ -621,12 +631,331 @@ fn parse_receive_address(address: &str) -> anyhow::Result<ReceiveAddress> {
     Err(anyhow!("Invalid Ark address"))
 }
 
+fn resolve_receive_address(state: &State, address: &str) -> anyhow::Result<ResolvedReceiveAddress> {
+    if let Ok(address) = parse_receive_address(address) {
+        address.validate_network(state.network)?;
+        address.validate_enabled(state)?;
+        let identifier = address.to_string();
+        return Ok(ResolvedReceiveAddress {
+            address,
+            identifier,
+        });
+    }
+
+    let name = normalize_custom_address_name(address)?;
+    let mut conn = state.db_pool.get()?;
+    let custom_address = CustomAddress::get_by_name(&mut conn, &name)?
+        .ok_or_else(|| anyhow!("Invalid Ark address"))?;
+    let address = custom_address
+        .ark_address
+        .parse::<ark::Address>()
+        .map(ReceiveAddress::Bark)
+        .map_err(|_| anyhow!("Stored custom address target is invalid"))?;
+    address.validate_network(state.network)?;
+
+    Ok(ResolvedReceiveAddress {
+        address,
+        identifier: name,
+    })
+}
+
 #[cfg(test)]
 fn validate_ark_address(ark_address: &str) -> anyhow::Result<ark::Address> {
     match parse_receive_address(ark_address)? {
         ReceiveAddress::Bark(address) => Ok(address),
         ReceiveAddress::Arkade(_) => Err(anyhow!("Invalid Ark address")),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAddressAuthMessageParams {
+    pub name: String,
+    pub ark_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCustomAddressInvoiceRequest {
+    pub name: String,
+    pub ark_address: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAddressInvoiceResponse {
+    pub id: i32,
+    pub name: String,
+    pub ark_address: String,
+    pub fee_sats: u64,
+    pub payment_hash: Option<String>,
+    pub invoice: String,
+    pub state: String,
+    pub active: bool,
+}
+
+pub async fn custom_address_auth_message(
+    Query(params): Query<CustomAddressAuthMessageParams>,
+    Extension(state): Extension<State>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let name = normalize_custom_address_name(&params.name).map_err(handle_anyhow_error)?;
+    let ark_address =
+        validate_custom_target_address(&params.ark_address, &state).map_err(handle_anyhow_error)?;
+    let message = custom_address_signature_message(&state.domain, &name, &ark_address.to_string());
+
+    Ok(Json(json!({
+        "status": "OK",
+        "name": name,
+        "arkAddress": ark_address.to_string(),
+        "message": message,
+    })))
+}
+
+pub async fn create_custom_address_invoice(
+    Extension(state): Extension<State>,
+    Json(request): Json<CreateCustomAddressInvoiceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let invoice = create_custom_address_invoice_impl(&state, request)
+        .await
+        .map_err(handle_anyhow_error)?;
+
+    Ok(Json(json!({
+        "status": "OK",
+        "customAddress": format!("{}@{}", invoice.name, state.domain),
+        "invoice": custom_address_invoice_response(invoice),
+    })))
+}
+
+pub async fn get_custom_address_invoice(
+    Path(id): Path<i32>,
+    Extension(state): Extension<State>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut invoice = find_custom_address_invoice(&state, id)?;
+    if invoice.state == InvoiceState::Pending as i32 {
+        refresh_custom_address_invoice_receive_status(&state, &invoice).await?;
+        invoice = find_custom_address_invoice(&state, id)?;
+    }
+
+    Ok(Json(json!({
+        "status": "OK",
+        "customAddress": format!("{}@{}", invoice.name, state.domain),
+        "invoice": custom_address_invoice_response(invoice),
+    })))
+}
+
+async fn create_custom_address_invoice_impl(
+    state: &State,
+    request: CreateCustomAddressInvoiceRequest,
+) -> anyhow::Result<CustomAddressInvoice> {
+    let name = normalize_custom_address_name(&request.name)?;
+    let ark_address = validate_custom_target_address(&request.ark_address, state)?;
+
+    if request.signature.len() > MAX_CUSTOM_SIGNATURE_LEN {
+        return Err(anyhow!("Signature is too large"));
+    }
+
+    let auth_message =
+        custom_address_signature_message(&state.domain, &name, &ark_address.to_string());
+    if !state
+        .barkd
+        .verify_address_message(
+            ark_address.to_string(),
+            auth_message.clone(),
+            request.signature.clone(),
+        )
+        .await?
+    {
+        return Err(anyhow!("Invalid signature"));
+    }
+
+    {
+        let mut conn = state.db_pool.get()?;
+        if CustomAddress::name_exists(&mut conn, &name)? {
+            return Err(anyhow!("Custom address is already taken"));
+        }
+        if CustomAddressInvoice::pending_name_exists(&mut conn, &name)? {
+            return Err(anyhow!("Custom address already has a pending invoice"));
+        }
+    }
+
+    let fee_receive_address = state.barkd.new_address().await?;
+    let fee_sats = state.custom_address_fee_sats;
+    let invoice = state
+        .barkd
+        .invoice_for_address(
+            fee_sats,
+            fee_receive_address.clone(),
+            Some(format!("arkzap.me custom address {name}")),
+        )
+        .await?;
+
+    if !invoice
+        .amount_milli_satoshis()
+        .is_some_and(|amount| amount == fee_sats * 1_000)
+    {
+        return Err(anyhow!("Invoice amount mismatch"));
+    }
+
+    let new_invoice = NewCustomAddressInvoice {
+        name,
+        ark_address: ark_address.to_string(),
+        auth_message,
+        signature: request.signature,
+        fee_receive_address,
+        bolt11: invoice.to_string(),
+        amount_msats: (fee_sats * 1_000) as i64,
+        payment_hash: Some(invoice.payment_hash().to_string()),
+        preimage: String::new(),
+        state: InvoiceState::Pending as i32,
+        expires_at: invoice_expires_at(&invoice),
+    };
+
+    let mut conn = state.db_pool.get()?;
+    new_invoice.insert(&mut conn)
+}
+
+async fn refresh_custom_address_invoice_receive_status(
+    state: &State,
+    invoice: &CustomAddressInvoice,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let payment_hash = custom_address_invoice_payment_hash(invoice);
+    let receive = state
+        .barkd
+        .receive_status(&payment_hash)
+        .await
+        .map_err(|e| {
+            error!(
+                "Error refreshing custom address invoice {} payment_hash={payment_hash}: {e:#}",
+                invoice.id
+            );
+            server_error_response()
+        })?;
+
+    let mut conn = state.db_pool.get().map_err(|e| {
+        error!("DB connection error: {e}");
+        server_error_response()
+    })?;
+
+    if let Some(receive) = receive {
+        if receive.preimage_revealed_at.is_some() {
+            invoice
+                .mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())
+                .map_err(|e| {
+                    error!(
+                        "Error activating custom address invoice {} payment_hash={payment_hash}: {e:?}",
+                        invoice.id
+                    );
+                    server_error_response()
+                })?;
+        } else if receive.finished_at.is_some() {
+            invoice.mark_cancelled(&mut conn).map_err(|e| {
+                error!(
+                    "Error marking custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
+                    invoice.id
+                );
+                server_error_response()
+            })?;
+        }
+    } else if invoice_has_expired(invoice) {
+        invoice.mark_cancelled(&mut conn).map_err(|e| {
+            error!(
+                "Error marking expired custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
+                invoice.id
+            );
+            server_error_response()
+        })?;
+    }
+
+    Ok(())
+}
+
+fn find_custom_address_invoice(
+    state: &State,
+    id: i32,
+) -> Result<CustomAddressInvoice, (StatusCode, Json<Value>)> {
+    let mut conn = state.db_pool.get().map_err(|e| {
+        error!("DB connection error: {e}");
+        server_error_response()
+    })?;
+
+    CustomAddressInvoice::get_by_id(&mut conn, id)
+        .map_err(|e| {
+            error!("Error looking up custom address invoice {id}: {e:?}");
+            server_error_response()
+        })?
+        .ok_or_else(|| (StatusCode::OK, Json(not_found_response())))
+}
+
+fn custom_address_invoice_response(invoice: CustomAddressInvoice) -> CustomAddressInvoiceResponse {
+    CustomAddressInvoiceResponse {
+        id: invoice.id,
+        name: invoice.name,
+        ark_address: invoice.ark_address,
+        fee_sats: (invoice.amount_msats / 1_000) as u64,
+        payment_hash: invoice.payment_hash,
+        invoice: invoice.bolt11,
+        state: invoice_state_name(invoice.state).to_string(),
+        active: invoice.state == InvoiceState::Settled as i32,
+    }
+}
+
+fn custom_address_invoice_payment_hash(invoice: &CustomAddressInvoice) -> String {
+    match invoice.payment_hash.as_deref() {
+        Some(payment_hash) => payment_hash.to_string(),
+        None => invoice.bolt11().payment_hash().to_string(),
+    }
+}
+
+fn invoice_state_name(state: i32) -> &'static str {
+    match state {
+        state if state == InvoiceState::Pending as i32 => "pending",
+        state if state == InvoiceState::Settled as i32 => "settled",
+        state if state == InvoiceState::Cancelled as i32 => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn validate_custom_target_address(address: &str, state: &State) -> anyhow::Result<ark::Address> {
+    let ark_address = address
+        .parse::<ark::Address>()
+        .map_err(|_| anyhow!("Custom addresses must target a Bark Ark address"))?;
+    if ark_address.is_testnet() != (state.network != Network::Bitcoin) {
+        return Err(anyhow!("Address is not valid for configured network"));
+    }
+    Ok(ark_address)
+}
+
+fn normalize_custom_address_name(name: &str) -> anyhow::Result<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.len() < 3 || name.len() > 32 {
+        return Err(anyhow!("Custom address name must be 3 to 32 characters"));
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+    }) {
+        return Err(anyhow!(
+            "Custom address name may only contain lowercase letters, numbers, hyphens, and underscores"
+        ));
+    }
+    let first = name.as_bytes()[0];
+    let last = name.as_bytes()[name.len() - 1];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !(last.is_ascii_lowercase() || last.is_ascii_digit())
+    {
+        return Err(anyhow!(
+            "Custom address name must start and end with a letter or number"
+        ));
+    }
+    if parse_receive_address(&name).is_ok() {
+        return Err(anyhow!("Custom address name cannot be an Ark address"));
+    }
+
+    Ok(name)
+}
+
+fn custom_address_signature_message(domain: &str, name: &str, ark_address: &str) -> String {
+    format!("arkzap.me custom address\nname: {name}\ndomain: {domain}\nark_address: {ark_address}")
 }
 
 /// HTTP endpoint that provides the LNURL-pay metadata and parameters.
@@ -644,20 +973,16 @@ pub async fn get_lnurl_pay(
     Path(address): Path<String>,
     Extension(state): Extension<State>,
 ) -> Result<Json<PayResponse>, (StatusCode, Json<Value>)> {
-    let address = match parse_receive_address(&address) {
+    let resolved_address = match resolve_receive_address(&state, &address) {
         Ok(address) => address,
         Err(e) => {
             return Err(handle_anyhow_error(e));
         }
     };
-    address
-        .validate_network(state.network)
-        .map_err(handle_anyhow_error)?;
-    address
-        .validate_enabled(&state)
-        .map_err(handle_anyhow_error)?;
-    let min_sendable = address.min_sendable_msats(state.min_sendable);
-    let address = address.to_string();
+    let min_sendable = resolved_address
+        .address
+        .min_sendable_msats(state.min_sendable);
+    let address = resolved_address.identifier;
 
     let metadata = calc_metadata(&address, &state.domain);
 
@@ -697,11 +1022,8 @@ pub async fn verify(
     Path((address, pay_hash)): Path<(String, String)>,
     Extension(state): Extension<State>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let address = parse_receive_address(&address).map_err(handle_anyhow_error)?;
-    address
-        .validate_network(state.network)
-        .map_err(handle_anyhow_error)?;
-    let address = address.to_string();
+    let address = resolve_receive_address(&state, &address).map_err(handle_anyhow_error)?;
+    let invoice_address = address.address.to_string();
 
     validate_hex_hash(&pay_hash, "Invalid payment hash")?;
 
@@ -713,7 +1035,7 @@ pub async fn verify(
     }
 
     let bolt11 = invoice.bolt11();
-    if invoice.address() != address {
+    if invoice.address() != invoice_address {
         return Ok(Json(not_found_response()));
     }
 
@@ -940,6 +1262,16 @@ impl InvoiceExpiry for Invoice {
 }
 
 impl InvoiceExpiry for ArkadeInvoice {
+    fn expires_at(&self) -> Option<NaiveDateTime> {
+        self.expires_at
+    }
+
+    fn bolt11(&self) -> Bolt11Invoice {
+        self.bolt11()
+    }
+}
+
+impl InvoiceExpiry for CustomAddressInvoice {
     fn expires_at(&self) -> Option<NaiveDateTime> {
         self.expires_at
     }

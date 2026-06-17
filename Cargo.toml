@@ -13,8 +13,8 @@ name = "arkzap-me"
 path = "src/main.rs"
 
 [dependencies]
-ark-lib = { git = "https://gitlab.com/benthecarman/bark.git", branch = "lightning-receive-for-offline-user" }
-bark-rest-client = { git = "https://gitlab.com/benthecarman/bark.git", branch = "lightning-receive-for-offline-user" }
+ark-lib = { git = "https://gitlab.com/benthecarman/bark.git", rev = "276da0603372f8d5704cd2dcfd757af727d3b400" }
+bark-rest-client = { git = "https://gitlab.com/benthecarman/bark.git", rev = "276da0603372f8d5704cd2dcfd757af727d3b400" }
 ark-bdk-wallet = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }
 ark-client = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }
 ark-core = { git = "https://github.com/benthecarman/arkade-rust-sdk", branch = "recv-for-user" }

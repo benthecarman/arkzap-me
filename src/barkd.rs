@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context};
 use bark_rest_client::apis::configuration::Configuration;
-use bark_rest_client::apis::lightning_api;
-use bark_rest_client::models::{LightningInvoiceForAddressRequest, LightningReceiveInfo};
+use bark_rest_client::apis::{lightning_api, wallet_api};
+use bark_rest_client::models::{
+    AddressVerifyMessageRequest, LightningInvoiceForAddressRequest, LightningReceiveInfo,
+};
 use lightning_invoice::Bolt11Invoice;
 use std::fmt;
 use std::str::FromStr;
@@ -48,6 +50,36 @@ impl BarkdClient {
         .context("failed to generate barkd invoice for Ark address")?;
 
         Bolt11Invoice::from_str(&info.invoice).context("barkd returned invalid BOLT11 invoice")
+    }
+
+    pub async fn new_address(&self) -> anyhow::Result<String> {
+        let response = wallet_api::address(&self.config)
+            .await
+            .map_err(barkd_error)
+            .context("failed to generate barkd receive address")?;
+
+        Ok(response.address)
+    }
+
+    pub async fn verify_address_message(
+        &self,
+        address: String,
+        message: String,
+        signature: String,
+    ) -> anyhow::Result<bool> {
+        let response = wallet_api::verify_address_message(
+            &self.config,
+            AddressVerifyMessageRequest {
+                address,
+                message,
+                signature,
+            },
+        )
+        .await
+        .map_err(barkd_error)
+        .context("failed to verify Bark address message")?;
+
+        Ok(response.valid)
     }
 
     pub async fn receive_status(
