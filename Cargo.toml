@@ -21,7 +21,7 @@ ark-core = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c25909
 
 anyhow = "1.0"
 async-trait = "0.1"
-axum = "0.6.20"
+axum = "0.8.9"
 bitcoin = { version = "0.32.7", features = ["serde"] }
 clap = { version = "4.1.14", features = ["derive", "env"] }
 chrono = { version = "0.4.26", features = ["serde"] }
@@ -31,12 +31,12 @@ dotenv = "0.15.0"
 lnurl-rs = { version = "0.9.0", default-features = false }
 lightning-invoice = { version = "0.33.2", features = ["serde", "std"] }
 log = "0.4"
-nostr = { version = "0.40.0", default-features = false, features = ["nip57"] }
-nostr-sdk = "0.40.0"
+nostr = { version = "0.44.3", default-features = false, features = ["nip57"] }
+nostr-sdk = "0.44.1"
 pretty_env_logger = "0.5.0"
 reqwest = { version = "0.12", features = ["json"] }
 serde = "1.0"
 serde_json = "1.0"
 tokio = { version = "1.26.0", features = ["full"] }
-tower-http = { version = "0.4.0", features = ["cors", "timeout"] }
+tower-http = { version = "0.7.0", features = ["cors", "timeout"] }
 hex = "0.4.3"

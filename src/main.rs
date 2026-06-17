@@ -123,9 +123,9 @@ async fn main() -> anyhow::Result<()> {
     let server_router = Router::new()
         .route("/", get(root))
         .route("/health-check", get(health_check))
-        .route("/get-invoice/:ark_address", get(get_invoice))
-        .route("/verify/:address/:pay_hash", get(verify))
-        .route("/.well-known/lnurlp/:ark_address", get(get_lnurl_pay))
+        .route("/get-invoice/{ark_address}", get(get_invoice))
+        .route("/verify/{address}/{pay_hash}", get(verify))
+        .route("/.well-known/lnurlp/{ark_address}", get(get_lnurl_pay))
         .route(
             "/custom-addresses/auth-message",
             get(custom_address_auth_message),
@@ -134,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
             "/custom-addresses",
             axum::routing::post(create_custom_address_invoice),
         )
-        .route("/custom-addresses/:id", get(get_custom_address_invoice))
+        .route("/custom-addresses/{id}", get(get_custom_address_invoice))
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(middleware::from_fn_with_state(
@@ -153,11 +153,19 @@ async fn main() -> anyhow::Result<()> {
                     Method::OPTIONS,
                 ]),
         )
-        .layer(TimeoutLayer::new(request_timeout))
+        .layer(TimeoutLayer::with_status_code(
+            http::StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes));
 
-    let server = axum::Server::bind(&addr)
-        .serve(server_router.into_make_service_with_connect_info::<SocketAddr>());
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("failed to bind webserver listener")?;
+    let server = axum::serve(
+        listener,
+        server_router.into_make_service_with_connect_info::<SocketAddr>(),
+    );
 
     // todo Invoice event stream for zaps
 

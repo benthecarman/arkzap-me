@@ -79,7 +79,7 @@ pub async fn rate_limit_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumState(rate_limiter): AxumState<Arc<RateLimiter>>,
     req: http::Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     if req.uri().path() == "/health-check" || rate_limiter.allow(addr.ip()) {
         return next.run(req).await;
