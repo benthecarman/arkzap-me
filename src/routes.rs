@@ -837,7 +837,7 @@ async fn refresh_custom_address_invoice_receive_status(
         server_error_response()
     })?;
 
-    if let Some(receive) = receive {
+    if let Some(receive) = receive.as_ref() {
         if receive.preimage_revealed_at.is_some() {
             invoice
                 .mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())
@@ -848,15 +848,45 @@ async fn refresh_custom_address_invoice_receive_status(
                     );
                     server_error_response()
                 })?;
-        } else if receive.finished_at.is_some() {
-            invoice.mark_cancelled(&mut conn).map_err(|e| {
+        }
+    }
+
+    let ark_paid = state
+        .barkd
+        .has_received_ark_payment(
+            &invoice.fee_receive_address,
+            (invoice.amount_msats / 1_000) as u64,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Error checking custom address invoice {} fee_receive_address={}: {e:#}",
+                invoice.id, invoice.fee_receive_address
+            );
+            server_error_response()
+        })?;
+
+    if ark_paid {
+        invoice
+            .mark_settled_and_activate(&mut conn, format!("ark:{}", invoice.fee_receive_address))
+            .map_err(|e| {
                 error!(
-                    "Error marking custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
+                    "Error activating custom address invoice {} from Ark payment: {e:?}",
                     invoice.id
                 );
                 server_error_response()
             })?;
-        }
+    } else if receive
+        .as_ref()
+        .is_some_and(|receive| receive.finished_at.is_some())
+    {
+        invoice.mark_cancelled(&mut conn).map_err(|e| {
+            error!(
+                "Error marking custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
+                invoice.id
+            );
+            server_error_response()
+        })?;
     } else if invoice_has_expired(invoice) {
         invoice.mark_cancelled(&mut conn).map_err(|e| {
             error!(
@@ -891,7 +921,7 @@ fn custom_address_invoice_response(invoice: CustomAddressInvoice) -> CustomAddre
     CustomAddressInvoiceResponse {
         id: invoice.id,
         name: invoice.name,
-        ark_address: invoice.ark_address,
+        ark_address: invoice.fee_receive_address,
         fee_sats: (invoice.amount_msats / 1_000) as u64,
         payment_hash: invoice.payment_hash,
         invoice: invoice.bolt11,

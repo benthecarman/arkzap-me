@@ -480,6 +480,9 @@ async fn claim_custom_address_invoice_if_paid(
         })?;
 
     let Some(receive) = receive else {
+        if claim_custom_address_invoice_if_ark_paid(state, &invoice).await? {
+            return Ok(());
+        }
         cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
         return Ok(());
     };
@@ -492,6 +495,10 @@ async fn claim_custom_address_invoice_if_paid(
                 invoice.name, invoice.ark_address, invoice.id, payment_hash
             );
         }
+        return Ok(());
+    }
+
+    if claim_custom_address_invoice_if_ark_paid(state, &invoice).await? {
         return Ok(());
     }
 
@@ -508,6 +515,41 @@ async fn claim_custom_address_invoice_if_paid(
     cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
 
     Ok(())
+}
+
+async fn claim_custom_address_invoice_if_ark_paid(
+    state: &State,
+    invoice: &CustomAddressInvoice,
+) -> anyhow::Result<bool> {
+    let ark_paid = state
+        .barkd
+        .has_received_ark_payment(
+            &invoice.fee_receive_address,
+            (invoice.amount_msats / 1_000) as u64,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to check Ark receive payment for custom address invoice {}",
+                invoice.id
+            )
+        })?;
+
+    if !ark_paid {
+        return Ok(false);
+    }
+
+    let mut conn = state.db_pool.get()?;
+    if invoice
+        .mark_settled_and_activate(&mut conn, format!("ark:{}", invoice.fee_receive_address))?
+    {
+        info!(
+            "Activated custom address {} for {} from Ark payment to {}",
+            invoice.name, invoice.ark_address, invoice.fee_receive_address
+        );
+    }
+
+    Ok(true)
 }
 
 fn cancel_custom_address_invoice_if_expired(
@@ -531,7 +573,7 @@ fn cancel_custom_address_invoice_if_expired(
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use crate::models::custom_address::CustomAddressInvoice;
+    use crate::models::custom_address::{CustomAddress, CustomAddressInvoice};
     use crate::models::invoice::NewInvoice;
     use ark::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use ark::mailbox::MailboxIdentifier;
@@ -825,13 +867,14 @@ mod db_tests {
 
         let (ark_address, vtxo_key) = test_bark_address()?;
         let ark_address = ark_address.to_string();
-        let fee_receive_address = ark_address.clone();
+        let fee_receive_address = "ark-generated-fee-address".to_string();
         let invoice = test_invoice(50_000);
         let barkd = MockBarkd::start(MockBarkdState {
             expected_fee_receive_address: fee_receive_address.to_string(),
             expected_amount_sat: 50,
             invoice: invoice.to_string(),
             invoice_description: None,
+            ark_payment_received: false,
         })
         .await?;
 
@@ -852,6 +895,7 @@ mod db_tests {
                 get(custom_address_auth_message),
             )
             .route("/custom-addresses", post(create_custom_address_invoice))
+            .route("/custom-addresses/{id}", get(get_custom_address_invoice))
             .layer(Extension(state));
         let app = TestServer::start(app).await?;
         let client = reqwest::Client::new();
@@ -896,7 +940,7 @@ mod db_tests {
         assert_eq!(created["status"], "OK");
         assert_eq!(created["customAddress"], "alice@example.com");
         assert_eq!(created["invoice"]["name"], "alice");
-        assert_eq!(created["invoice"]["arkAddress"], ark_address);
+        assert_eq!(created["invoice"]["arkAddress"], fee_receive_address);
         assert_eq!(created["invoice"]["invoice"], invoice.to_string());
         assert_eq!(created["invoice"]["state"], "pending");
         assert_eq!(created["invoice"]["active"], false);
@@ -920,6 +964,32 @@ mod db_tests {
             mock_state.invoice_description.as_deref(),
             Some("arkzap.me custom address alice")
         );
+        drop(mock_state);
+
+        {
+            let mut mock_state = barkd.state.lock().unwrap();
+            mock_state.ark_payment_received = true;
+        }
+
+        let purchase_id = created["invoice"]["id"].as_i64().unwrap();
+        let activated: Value = client
+            .get(format!(
+                "{}/custom-addresses/{}",
+                app.base_url(),
+                purchase_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(activated["invoice"]["state"], "settled");
+        assert_eq!(activated["invoice"]["active"], true);
+        assert_eq!(activated["invoice"]["arkAddress"], fee_receive_address);
+
+        let custom_address = CustomAddress::get_by_name(&mut conn, "alice")?.unwrap();
+        assert_eq!(custom_address.ark_address, ark_address);
 
         Ok(())
     }
@@ -929,6 +999,7 @@ mod db_tests {
         expected_amount_sat: u64,
         invoice: String,
         invoice_description: Option<String>,
+        ark_payment_received: bool,
     }
 
     struct MockBarkd {
@@ -946,6 +1017,11 @@ mod db_tests {
                     "/api/v1/lightning/receives/invoice/for-address",
                     post(mock_invoice_for_address),
                 )
+                .route(
+                    "/api/v1/lightning/receives/{identifier}",
+                    get(mock_receive_status),
+                )
+                .route("/api/v1/history", get(mock_history))
                 .with_state(state.clone());
             let (addr, shutdown) = spawn_router(app).await?;
 
@@ -1026,6 +1102,49 @@ mod db_tests {
         assert_eq!(body["address"], state.expected_fee_receive_address);
         state.invoice_description = body["description"].as_str().map(str::to_string);
         Json(json!({ "invoice": state.invoice }))
+    }
+
+    async fn mock_receive_status(
+        axum::extract::Path(_identifier): axum::extract::Path<String>,
+    ) -> axum::http::StatusCode {
+        axum::http::StatusCode::NOT_FOUND
+    }
+
+    async fn mock_history(
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<MockBarkdState>>>,
+    ) -> Json<Value> {
+        let state = state.lock().unwrap();
+        if !state.ark_payment_received {
+            return Json(json!([]));
+        }
+
+        Json(json!([{
+            "id": 1,
+            "status": "successful",
+            "subsystem": {
+                "name": "arkoor",
+                "kind": "receive"
+            },
+            "intended_balance_sat": state.expected_amount_sat,
+            "effective_balance_sat": state.expected_amount_sat,
+            "offchain_fee_sat": 0,
+            "sent_to": [],
+            "received_on": [{
+                "destination": {
+                    "type": "ark",
+                    "value": state.expected_fee_receive_address
+                },
+                "amount_sat": state.expected_amount_sat
+            }],
+            "input_vtxos": [],
+            "output_vtxos": [],
+            "exited_vtxos": [],
+            "time": {
+                "created_at": "2026-06-17T00:00:00-05:00",
+                "updated_at": "2026-06-17T00:00:00-05:00",
+                "completed_at": "2026-06-17T00:00:00-05:00"
+            }
+        }]))
     }
 
     fn test_invoice(amount_msats: u64) -> lightning_invoice::Bolt11Invoice {

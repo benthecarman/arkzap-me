@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context};
 use ark::bitcoin::secp256k1::schnorr;
 use bark_rest_client::apis::configuration::Configuration;
-use bark_rest_client::apis::{lightning_api, wallet_api};
-use bark_rest_client::models::{LightningInvoiceForAddressRequest, LightningReceiveInfo};
+use bark_rest_client::apis::{history_api, lightning_api, wallet_api};
+use bark_rest_client::models::{
+    LightningInvoiceForAddressRequest, LightningReceiveInfo, PaymentMethod,
+};
 use lightning_invoice::Bolt11Invoice;
 use std::fmt;
 use std::str::FromStr;
@@ -97,6 +99,27 @@ impl BarkdClient {
             .await
             .map_err(barkd_error)
             .context("failed to list barkd receive statuses")
+    }
+
+    pub async fn has_received_ark_payment(
+        &self,
+        address: &str,
+        min_amount_sat: u64,
+    ) -> anyhow::Result<bool> {
+        let movements = history_api::list(&self.config)
+            .await
+            .map_err(barkd_error)
+            .context("failed to list barkd wallet history")?;
+
+        Ok(movements.into_iter().any(|movement| {
+            movement.received_on.into_iter().any(|destination| {
+                matches!(
+                    destination.destination,
+                    PaymentMethod::Ark(received_address)
+                        if received_address == address && destination.amount.to_sat() >= min_amount_sat
+                )
+            })
+        }))
     }
 }
 
