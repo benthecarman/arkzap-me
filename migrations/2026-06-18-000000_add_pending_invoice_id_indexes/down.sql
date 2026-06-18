@@ -1,0 +1,3 @@
+DROP INDEX idx_custom_address_invoice_pending_id;
+DROP INDEX idx_arkade_invoice_pending_id;
+DROP INDEX idx_invoice_pending_id;
