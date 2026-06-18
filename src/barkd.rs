@@ -6,6 +6,7 @@ use bark_rest_client::models::{
     LightningInvoiceForAddressRequest, LightningReceiveInfo, PaymentMethod,
 };
 use lightning_invoice::Bolt11Invoice;
+use log::info;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -38,11 +39,17 @@ impl BarkdClient {
         address: String,
         description: Option<String>,
     ) -> anyhow::Result<Bolt11Invoice> {
+        info!(
+            "Requesting barkd Lightning invoice amount_sats={} address={} description_present={}",
+            amount_sat,
+            address,
+            description.is_some()
+        );
         let info = lightning_api::generate_invoice_for_address(
             &self.config,
             LightningInvoiceForAddressRequest {
                 amount_sat,
-                address,
+                address: address.clone(),
                 description,
             },
         )
@@ -50,15 +57,29 @@ impl BarkdClient {
         .map_err(barkd_error)
         .context("failed to generate barkd invoice for Ark address")?;
 
-        Bolt11Invoice::from_str(&info.invoice).context("barkd returned invalid BOLT11 invoice")
+        let invoice = Bolt11Invoice::from_str(&info.invoice)
+            .context("barkd returned invalid BOLT11 invoice")?;
+        info!(
+            "Generated barkd Lightning invoice amount_sats={} address={} payment_hash={} expires_at={:?}",
+            amount_sat,
+            address,
+            invoice.payment_hash(),
+            invoice.expires_at()
+        );
+        Ok(invoice)
     }
 
     pub async fn new_address(&self) -> anyhow::Result<String> {
+        info!("Requesting new barkd receive address");
         let response = wallet_api::address(&self.config)
             .await
             .map_err(barkd_error)
             .context("failed to generate barkd receive address")?;
 
+        info!(
+            "Generated new barkd receive address address={}",
+            response.address
+        );
         Ok(response.address)
     }
 
@@ -83,11 +104,21 @@ impl BarkdClient {
         &self,
         identifier: &str,
     ) -> anyhow::Result<Option<LightningReceiveInfo>> {
+        info!("Requesting barkd receive status identifier={identifier}");
         match lightning_api::get_receive_status(&self.config, identifier).await {
-            Ok(status) => Ok(Some(status)),
+            Ok(status) => {
+                info!(
+                    "Received barkd receive status identifier={} preimage_revealed={} finished={}",
+                    identifier,
+                    status.preimage_revealed_at.is_some(),
+                    status.finished_at.is_some()
+                );
+                Ok(Some(status))
+            }
             Err(bark_rest_client::apis::Error::ResponseError(resp))
                 if resp.status == reqwest::StatusCode::NOT_FOUND =>
             {
+                info!("No barkd receive status found identifier={identifier}");
                 Ok(None)
             }
             Err(e) => Err(barkd_error(e).context("failed to get barkd receive status")),
@@ -95,10 +126,13 @@ impl BarkdClient {
     }
 
     pub async fn pending_receives(&self) -> anyhow::Result<Vec<LightningReceiveInfo>> {
-        lightning_api::list_receive_statuses(&self.config)
+        info!("Requesting barkd pending receive statuses");
+        let receives = lightning_api::list_receive_statuses(&self.config)
             .await
             .map_err(barkd_error)
-            .context("failed to list barkd receive statuses")
+            .context("failed to list barkd receive statuses")?;
+        info!("Listed {} barkd pending receive status(es)", receives.len());
+        Ok(receives)
     }
 
     pub async fn has_received_ark_payment(
@@ -106,12 +140,17 @@ impl BarkdClient {
         address: &str,
         min_amount_sat: u64,
     ) -> anyhow::Result<bool> {
+        info!(
+            "Checking barkd wallet history for Ark payment address={} min_amount_sats={}",
+            address, min_amount_sat
+        );
         let movements = history_api::list(&self.config)
             .await
             .map_err(barkd_error)
             .context("failed to list barkd wallet history")?;
 
-        Ok(movements.into_iter().any(|movement| {
+        let movement_count = movements.len();
+        let received = movements.into_iter().any(|movement| {
             movement.received_on.into_iter().any(|destination| {
                 matches!(
                     destination.destination,
@@ -119,7 +158,12 @@ impl BarkdClient {
                         if received_address == address && destination.amount.to_sat() >= min_amount_sat
                 )
             })
-        }))
+        });
+        info!(
+            "Checked barkd wallet history for Ark payment address={} min_amount_sats={} movements={} received={}",
+            address, min_amount_sat, movement_count, received
+        );
+        Ok(received)
     }
 }
 

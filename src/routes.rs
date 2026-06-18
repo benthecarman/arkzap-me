@@ -15,7 +15,7 @@ use diesel::Connection;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::pay::PayResponse;
 use lnurl::Tag;
-use log::error;
+use log::{error, info, warn};
 use nostr::{Event, JsonUtil};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -752,11 +752,22 @@ async fn create_custom_address_invoice_impl(
     let ark_address = validate_custom_target_address(&request.ark_address, state)?;
 
     if request.signature.len() > MAX_CUSTOM_SIGNATURE_LEN {
+        warn!(
+            "Rejected custom address invoice for name={} ark_address={} because signature_len={} exceeds max={}",
+            name,
+            ark_address,
+            request.signature.len(),
+            MAX_CUSTOM_SIGNATURE_LEN
+        );
         return Err(anyhow!("Signature is too large"));
     }
 
     let auth_message =
         custom_address_signature_message(&state.domain, &name, &ark_address.to_string());
+    info!(
+        "Verifying custom address ownership for name={} ark_address={} domain={}",
+        name, ark_address, state.domain
+    );
     if !state
         .barkd
         .verify_address_message(
@@ -766,21 +777,37 @@ async fn create_custom_address_invoice_impl(
         )
         .await?
     {
+        warn!(
+            "Rejected custom address invoice for name={} ark_address={} because signature verification failed",
+            name, ark_address
+        );
         return Err(anyhow!("Invalid signature"));
     }
 
     {
         let mut conn = state.db_pool.get()?;
         if CustomAddress::name_exists(&mut conn, &name)? {
+            warn!(
+                "Rejected custom address invoice for name={} because address is already active",
+                name
+            );
             return Err(anyhow!("Custom address is already taken"));
         }
         if CustomAddressInvoice::pending_name_exists(&mut conn, &name)? {
+            warn!(
+                "Rejected custom address invoice for name={} because a pending invoice already exists",
+                name
+            );
             return Err(anyhow!("Custom address already has a pending invoice"));
         }
     }
 
     let fee_receive_address = state.barkd.new_address().await?;
     let fee_sats = state.custom_address_fee_sats;
+    info!(
+        "Creating custom address fee invoice name={} ark_address={} fee_receive_address={} fee_sats={}",
+        name, ark_address, fee_receive_address, fee_sats
+    );
     let invoice = state
         .barkd
         .invoice_for_address(
@@ -794,6 +821,12 @@ async fn create_custom_address_invoice_impl(
         .amount_milli_satoshis()
         .is_some_and(|amount| amount == fee_sats * 1_000)
     {
+        error!(
+            "Custom address fee invoice amount mismatch name={} expected_msats={} actual_msats={:?}",
+            name,
+            fee_sats * 1_000,
+            invoice.amount_milli_satoshis()
+        );
         return Err(anyhow!("Invoice amount mismatch"));
     }
 
@@ -812,7 +845,18 @@ async fn create_custom_address_invoice_impl(
     };
 
     let mut conn = state.db_pool.get()?;
-    new_invoice.insert(&mut conn)
+    let invoice = new_invoice.insert(&mut conn)?;
+    info!(
+        "Created custom address invoice id={} name={} ark_address={} fee_receive_address={} payment_hash={} amount_msats={} expires_at={:?}",
+        invoice.id,
+        invoice.name,
+        invoice.ark_address,
+        invoice.fee_receive_address,
+        custom_address_invoice_payment_hash(&invoice),
+        invoice.amount_msats,
+        invoice.expires_at
+    );
+    Ok(invoice)
 }
 
 async fn refresh_custom_address_invoice_receive_status(
@@ -820,6 +864,14 @@ async fn refresh_custom_address_invoice_receive_status(
     invoice: &CustomAddressInvoice,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let payment_hash = custom_address_invoice_payment_hash(invoice);
+    info!(
+        "Refreshing custom address invoice id={} name={} payment_hash={} amount_msats={} fee_receive_address={}",
+        invoice.id,
+        invoice.name,
+        payment_hash,
+        invoice.amount_msats,
+        invoice.fee_receive_address
+    );
     let receive = state
         .barkd
         .receive_status(&payment_hash)
@@ -838,8 +890,15 @@ async fn refresh_custom_address_invoice_receive_status(
     })?;
 
     if let Some(receive) = receive.as_ref() {
+        info!(
+            "Custom address invoice id={} Lightning receive status payment_hash={} preimage_revealed={} finished={}",
+            invoice.id,
+            payment_hash,
+            receive.preimage_revealed_at.is_some(),
+            receive.finished_at.is_some()
+        );
         if receive.preimage_revealed_at.is_some() {
-            invoice
+            let activated = invoice
                 .mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())
                 .map_err(|e| {
                     error!(
@@ -848,7 +907,24 @@ async fn refresh_custom_address_invoice_receive_status(
                     );
                     server_error_response()
                 })?;
+            if activated {
+                info!(
+                    "Activated custom address {} for {} from Lightning payment invoice_id={} payment_hash={}",
+                    invoice.name, invoice.ark_address, invoice.id, payment_hash
+                );
+            } else {
+                warn!(
+                    "Custom address invoice activation was a no-op invoice_id={} name={} payment_hash={}",
+                    invoice.id, invoice.name, payment_hash
+                );
+            }
+            return Ok(());
         }
+    } else {
+        info!(
+            "Custom address invoice id={} has no Lightning receive status payment_hash={}",
+            invoice.id, payment_hash
+        );
     }
 
     let ark_paid = state
@@ -865,9 +941,16 @@ async fn refresh_custom_address_invoice_receive_status(
             );
             server_error_response()
         })?;
+    info!(
+        "Custom address invoice id={} Ark fee payment check fee_receive_address={} amount_sats={} paid={}",
+        invoice.id,
+        invoice.fee_receive_address,
+        invoice.amount_msats / 1_000,
+        ark_paid
+    );
 
     if ark_paid {
-        invoice
+        let activated = invoice
             .mark_settled_and_activate(&mut conn, format!("ark:{}", invoice.fee_receive_address))
             .map_err(|e| {
                 error!(
@@ -876,25 +959,53 @@ async fn refresh_custom_address_invoice_receive_status(
                 );
                 server_error_response()
             })?;
+        if activated {
+            info!(
+                "Activated custom address {} for {} from Ark payment invoice_id={} fee_receive_address={}",
+                invoice.name, invoice.ark_address, invoice.id, invoice.fee_receive_address
+            );
+        } else {
+            warn!(
+                "Custom address invoice Ark activation was a no-op invoice_id={} name={} fee_receive_address={}",
+                invoice.id, invoice.name, invoice.fee_receive_address
+            );
+        }
     } else if receive
         .as_ref()
         .is_some_and(|receive| receive.finished_at.is_some())
     {
-        invoice.mark_cancelled(&mut conn).map_err(|e| {
+        let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
             error!(
                 "Error marking custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
                 invoice.id
             );
             server_error_response()
         })?;
+        if cancelled {
+            info!(
+                "Cancelled terminal unpaid custom address invoice id={} payment_hash={}",
+                invoice.id, payment_hash
+            );
+        }
     } else if invoice_has_expired(invoice) {
-        invoice.mark_cancelled(&mut conn).map_err(|e| {
+        let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
             error!(
                 "Error marking expired custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
                 invoice.id
             );
             server_error_response()
         })?;
+        if cancelled {
+            info!(
+                "Cancelled expired custom address invoice id={} payment_hash={} amount_msats={}",
+                invoice.id, payment_hash, invoice.amount_msats
+            );
+        }
+    } else {
+        info!(
+            "Custom address invoice id={} remains pending payment_hash={}",
+            invoice.id, payment_hash
+        );
     }
 
     Ok(())
@@ -1183,6 +1294,10 @@ async fn refresh_bark_invoice_receive_status(
     invoice: &Invoice,
     payment_hash: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    info!(
+        "Refreshing Bark invoice payment status invoice_id={} payment_hash={} amount_msats={}",
+        invoice.id, payment_hash, invoice.amount_msats
+    );
     let receive = state
         .barkd
         .receive_status(payment_hash)
@@ -1198,26 +1313,66 @@ async fn refresh_bark_invoice_receive_status(
     })?;
 
     if let Some(receive) = receive {
+        info!(
+            "Bark invoice receive status invoice_id={} payment_hash={} preimage_revealed={} finished={}",
+            invoice.id,
+            payment_hash,
+            receive.preimage_revealed_at.is_some(),
+            receive.finished_at.is_some()
+        );
         if receive.preimage_revealed_at.is_some() {
-            invoice
+            let settled = invoice
                 .mark_settled(&mut conn, receive.payment_preimage.to_string())
                 .map_err(|e| {
                     error!("Error marking invoice settled for payment_hash={payment_hash}: {e:?}");
                     server_error_response()
                 })?;
+            if settled {
+                info!(
+                    "Marked Bark invoice settled invoice_id={} payment_hash={} amount_msats={}",
+                    invoice.id, payment_hash, invoice.amount_msats
+                );
+            } else {
+                warn!(
+                    "Bark invoice settle was a no-op invoice_id={} payment_hash={}",
+                    invoice.id, payment_hash
+                );
+            }
         } else if receive.finished_at.is_some() {
-            invoice.mark_cancelled(&mut conn).map_err(|e| {
+            let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
                 error!("Error marking invoice cancelled for payment_hash={payment_hash}: {e:?}");
                 server_error_response()
             })?;
+            if cancelled {
+                info!(
+                    "Marked terminal unpaid Bark invoice cancelled invoice_id={} payment_hash={}",
+                    invoice.id, payment_hash
+                );
+            } else {
+                warn!(
+                    "Bark invoice cancellation was a no-op invoice_id={} payment_hash={}",
+                    invoice.id, payment_hash
+                );
+            }
         }
     } else if invoice_has_expired(invoice) {
-        invoice.mark_cancelled(&mut conn).map_err(|e| {
+        let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
             error!(
                 "Error marking expired invoice cancelled for payment_hash={payment_hash}: {e:?}"
             );
             server_error_response()
         })?;
+        if cancelled {
+            info!(
+                "Marked expired Bark invoice cancelled invoice_id={} payment_hash={} amount_msats={}",
+                invoice.id, payment_hash, invoice.amount_msats
+            );
+        }
+    } else {
+        info!(
+            "Bark invoice remains pending invoice_id={} payment_hash={}",
+            invoice.id, payment_hash
+        );
     }
 
     Ok(())
@@ -1228,17 +1383,27 @@ async fn refresh_arkade_invoice_receive_status(
     invoice: &ArkadeInvoice,
     payment_hash: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    info!(
+        "Refreshing Arkade invoice payment status invoice_id={} payment_hash={} amount_msats={} swap_id={}",
+        invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
+    );
     if invoice_has_expired(invoice) {
         let mut conn = state.db_pool.get().map_err(|e| {
             error!("DB connection error: {e}");
             server_error_response()
         })?;
-        invoice.mark_cancelled(&mut conn).map_err(|e| {
+        let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
             error!(
                 "Error marking expired Arkade invoice cancelled for payment_hash={payment_hash}: {e:?}"
             );
             server_error_response()
         })?;
+        if cancelled {
+            info!(
+                "Marked expired Arkade invoice cancelled invoice_id={} payment_hash={} amount_msats={} swap_id={}",
+                invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
+            );
+        }
         return Ok(());
     }
 
@@ -1256,7 +1421,7 @@ async fn refresh_arkade_invoice_receive_status(
                 error!("DB connection error: {e}");
                 server_error_response()
             })?;
-            invoice
+            let settled = invoice
                 .mark_settled(&mut conn, hex::encode(preimage))
                 .map_err(|e| {
                     error!(
@@ -1264,6 +1429,17 @@ async fn refresh_arkade_invoice_receive_status(
                     );
                     server_error_response()
                 })?;
+            if settled {
+                info!(
+                    "Marked Arkade invoice settled invoice_id={} payment_hash={} amount_msats={} swap_id={}",
+                    invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
+                );
+            } else {
+                warn!(
+                    "Arkade invoice settle was a no-op invoice_id={} payment_hash={} swap_id={}",
+                    invoice.id, payment_hash, invoice.swap_id
+                );
+            }
         }
         Err(e) => {
             error!(

@@ -260,6 +260,13 @@ async fn claim_paid_custom_address_invoices_once(state: &State) -> anyhow::Resul
         CustomAddressInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
     };
 
+    if !invoices.is_empty() {
+        info!(
+            "Checking {} pending custom address invoice(s) for payment",
+            invoices.len()
+        );
+    }
+
     for invoice in invoices {
         let payment_hash = invoice_payment_hash(&invoice);
         if let Err(e) = claim_custom_address_invoice_if_paid(state, invoice, payment_hash).await {
@@ -468,6 +475,11 @@ async fn claim_custom_address_invoice_if_paid(
     invoice: CustomAddressInvoice,
     payment_hash: String,
 ) -> anyhow::Result<()> {
+    info!(
+        "Checking custom address invoice {} name={} payment_hash={} amount_msats={} fee_receive_address={}",
+        invoice.id, invoice.name, payment_hash, invoice.amount_msats, invoice.fee_receive_address
+    );
+
     let receive = state
         .barkd
         .receive_status(&payment_hash)
@@ -480,6 +492,10 @@ async fn claim_custom_address_invoice_if_paid(
         })?;
 
     let Some(receive) = receive else {
+        info!(
+            "Custom address invoice {} has no Lightning receive status; checking Ark fee payment fee_receive_address={}",
+            invoice.id, invoice.fee_receive_address
+        );
         if claim_custom_address_invoice_if_ark_paid(state, &invoice).await? {
             return Ok(());
         }
@@ -487,12 +503,25 @@ async fn claim_custom_address_invoice_if_paid(
         return Ok(());
     };
 
+    info!(
+        "Custom address invoice {} Lightning receive status payment_hash={} preimage_revealed={} finished={}",
+        invoice.id,
+        payment_hash,
+        receive.preimage_revealed_at.is_some(),
+        receive.finished_at.is_some()
+    );
+
     if receive.preimage_revealed_at.is_some() {
         let mut conn = state.db_pool.get()?;
         if invoice.mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())? {
             info!(
                 "Activated custom address {} for {} from invoice {} payment_hash={}",
                 invoice.name, invoice.ark_address, invoice.id, payment_hash
+            );
+        } else {
+            warn!(
+                "Custom address invoice activation was a no-op invoice_id={} name={} payment_hash={}",
+                invoice.id, invoice.name, payment_hash
             );
         }
         return Ok(());
@@ -509,6 +538,11 @@ async fn claim_custom_address_invoice_if_paid(
                 "Cancelled terminal unpaid custom address invoice {} payment_hash={}",
                 invoice.id, payment_hash
             );
+        } else {
+            warn!(
+                "Custom address invoice cancellation was a no-op invoice_id={} name={} payment_hash={}",
+                invoice.id, invoice.name, payment_hash
+            );
         }
     }
 
@@ -521,6 +555,13 @@ async fn claim_custom_address_invoice_if_ark_paid(
     state: &State,
     invoice: &CustomAddressInvoice,
 ) -> anyhow::Result<bool> {
+    info!(
+        "Checking Ark fee payment for custom address invoice {} name={} fee_receive_address={} amount_sats={}",
+        invoice.id,
+        invoice.name,
+        invoice.fee_receive_address,
+        invoice.amount_msats / 1_000
+    );
     let ark_paid = state
         .barkd
         .has_received_ark_payment(
@@ -536,6 +577,10 @@ async fn claim_custom_address_invoice_if_ark_paid(
         })?;
 
     if !ark_paid {
+        info!(
+            "No Ark fee payment found for custom address invoice {} fee_receive_address={}",
+            invoice.id, invoice.fee_receive_address
+        );
         return Ok(false);
     }
 
@@ -546,6 +591,11 @@ async fn claim_custom_address_invoice_if_ark_paid(
         info!(
             "Activated custom address {} for {} from Ark payment to {}",
             invoice.name, invoice.ark_address, invoice.fee_receive_address
+        );
+    } else {
+        warn!(
+            "Custom address invoice Ark activation was a no-op invoice_id={} name={} fee_receive_address={}",
+            invoice.id, invoice.name, invoice.fee_receive_address
         );
     }
 

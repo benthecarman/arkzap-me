@@ -14,6 +14,7 @@ use bitcoin::{Address, Amount, Network, Transaction, Txid, XOnlyPublicKey};
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use lightning_invoice::Bolt11Invoice;
+use log::info;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::str::FromStr;
@@ -103,6 +104,13 @@ impl ArkadeClient {
         recipient_address: ArkAddress,
         description: Option<String>,
     ) -> anyhow::Result<ArkadeInvoiceResult> {
+        info!(
+            "Requesting Arkade Lightning invoice amount_sats={} recipient_address={} description_present={} invoice_expiry_secs={:?}",
+            amount_sat,
+            recipient_address,
+            description.is_some(),
+            self.invoice_expiry_secs
+        );
         let result = self
             .client
             .get_ln_invoice_for_address(
@@ -115,6 +123,14 @@ impl ArkadeClient {
             .map_err(anyhow::Error::msg)
             .context("failed to generate Arkade invoice for address")?;
 
+        info!(
+            "Generated Arkade Lightning invoice amount_sats={} recipient_address={} payment_hash={} swap_id={} expires_at={:?}",
+            amount_sat,
+            recipient_address,
+            result.invoice.payment_hash(),
+            result.swap_id,
+            result.invoice.expires_at()
+        );
         Ok(ArkadeInvoiceResult {
             invoice: result.invoice,
             swap_id: result.swap_id,
@@ -122,12 +138,18 @@ impl ArkadeClient {
     }
 
     pub async fn claim_receive(&self, swap_id: &str) -> anyhow::Result<[u8; 32]> {
+        info!(
+            "Waiting to claim Arkade receive swap_id={} timeout_secs={}",
+            swap_id,
+            self.claim_timeout.as_secs()
+        );
         let result = tokio::time::timeout(self.claim_timeout, self.client.wait_for_vhtlc(swap_id))
             .await
             .context("Arkade receive is not ready to claim yet")?
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed to claim Arkade receive swap {swap_id}"))?;
 
+        info!("Claimed Arkade receive swap_id={swap_id}");
         Ok(result.preimage)
     }
 }
