@@ -103,6 +103,26 @@ impl CustomAddressInvoice {
             .is_some())
     }
 
+    pub fn cancel_expired_pending(conn: &mut PgConnection) -> anyhow::Result<usize> {
+        Ok(diesel::update(custom_address_invoice::table)
+            .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
+            .filter(custom_address_invoice::expires_at.le(diesel::dsl::now))
+            .set(custom_address_invoice::state.eq(InvoiceState::Cancelled as i32))
+            .execute(conn)?)
+    }
+
+    pub fn cancel_expired_pending_for_name(
+        conn: &mut PgConnection,
+        address_name: &str,
+    ) -> anyhow::Result<usize> {
+        Ok(diesel::update(custom_address_invoice::table)
+            .filter(custom_address_invoice::name.eq(address_name))
+            .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
+            .filter(custom_address_invoice::expires_at.le(diesel::dsl::now))
+            .set(custom_address_invoice::state.eq(InvoiceState::Cancelled as i32))
+            .execute(conn)?)
+    }
+
     pub fn mark_lightning_settled_and_activate(
         &self,
         conn: &mut PgConnection,

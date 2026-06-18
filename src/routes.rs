@@ -787,6 +787,13 @@ async fn create_custom_address_invoice_impl(
 
     {
         let mut conn = state.db_pool.get()?;
+        let cancelled = CustomAddressInvoice::cancel_expired_pending_for_name(&mut conn, &name)?;
+        if cancelled > 0 {
+            info!(
+                "Cancelled {} expired pending custom address invoice(s) for name={}",
+                cancelled, name
+            );
+        }
         if CustomAddress::name_exists(&mut conn, &name)? {
             warn!(
                 "Rejected custom address invoice for name={} because address is already active",

@@ -257,6 +257,13 @@ async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
 async fn claim_paid_custom_address_invoices_once(state: &State) -> anyhow::Result<()> {
     let invoices = {
         let mut conn = state.db_pool.get()?;
+        let cancelled = CustomAddressInvoice::cancel_expired_pending(&mut conn)?;
+        if cancelled > 0 {
+            info!(
+                "Cancelled {} expired pending custom address invoice(s)",
+                cancelled
+            );
+        }
         CustomAddressInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
     };
 
@@ -627,7 +634,9 @@ fn cancel_custom_address_invoice_if_expired(
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use crate::models::custom_address::{CustomAddress, CustomAddressInvoice};
+    use crate::models::custom_address::{
+        CustomAddress, CustomAddressInvoice, NewCustomAddressInvoice,
+    };
     use crate::models::invoice::NewInvoice;
     use ark::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use ark::mailbox::MailboxIdentifier;
@@ -923,6 +932,70 @@ mod db_tests {
         assert_eq!(active_invoice.state, InvoiceState::Settled as i32);
         assert_eq!(active_invoice.preimage, "22".repeat(32));
         assert!(active_invoice.settled_at.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_address_invoice_model_cancels_expired_pending_names() -> anyhow::Result<()> {
+        let Some((_schema, mut conn)) = TestSchema::new("custom_invoice_expiry")? else {
+            return Ok(());
+        };
+
+        conn.run_pending_migrations(MIGRATIONS)
+            .map_err(|e| anyhow::anyhow!("failed to run migrations: {e}"))?;
+
+        let expired_invoice = NewCustomAddressInvoice {
+            name: "alice".to_string(),
+            ark_address: "ark-test-address".to_string(),
+            auth_message: "message".to_string(),
+            signature: "signature".to_string(),
+            fee_receive_address: "ark-fee-address-1".to_string(),
+            bolt11: "lnbc1expired".to_string(),
+            amount_msats: 1_000,
+            payment_hash: Some("33".repeat(32)),
+            preimage: String::new(),
+            ark_payment_reference: None,
+            state: InvoiceState::Pending as i32,
+            expires_at: Some((chrono::Utc::now() - ChronoDuration::minutes(1)).naive_utc()),
+        }
+        .insert(&mut conn)?;
+
+        let active_invoice = NewCustomAddressInvoice {
+            name: "bob".to_string(),
+            ark_address: "ark-test-address".to_string(),
+            auth_message: "message".to_string(),
+            signature: "signature".to_string(),
+            fee_receive_address: "ark-fee-address-2".to_string(),
+            bolt11: "lnbc1active".to_string(),
+            amount_msats: 1_000,
+            payment_hash: Some("44".repeat(32)),
+            preimage: String::new(),
+            ark_payment_reference: None,
+            state: InvoiceState::Pending as i32,
+            expires_at: Some((chrono::Utc::now() + ChronoDuration::minutes(5)).naive_utc()),
+        }
+        .insert(&mut conn)?;
+
+        assert!(CustomAddressInvoice::pending_name_exists(
+            &mut conn, "alice"
+        )?);
+
+        assert_eq!(
+            CustomAddressInvoice::cancel_expired_pending_for_name(&mut conn, "alice")?,
+            1
+        );
+        assert!(!CustomAddressInvoice::pending_name_exists(
+            &mut conn, "alice"
+        )?);
+        assert!(CustomAddressInvoice::pending_name_exists(&mut conn, "bob")?);
+
+        let expired_invoice =
+            CustomAddressInvoice::get_by_id(&mut conn, expired_invoice.id)?.unwrap();
+        assert_eq!(expired_invoice.state, InvoiceState::Cancelled as i32);
+        let active_invoice =
+            CustomAddressInvoice::get_by_id(&mut conn, active_invoice.id)?.unwrap();
+        assert_eq!(active_invoice.state, InvoiceState::Pending as i32);
 
         Ok(())
     }
