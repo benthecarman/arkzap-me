@@ -6,6 +6,8 @@ use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+const CUSTOM_ADDRESS_PENDING_TTL: chrono::Duration = chrono::Duration::hours(1);
+
 #[derive(Queryable, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 #[diesel(table_name = custom_addresses)]
@@ -104,23 +106,57 @@ impl CustomAddressInvoice {
     }
 
     pub fn cancel_expired_pending(conn: &mut PgConnection) -> anyhow::Result<usize> {
-        Ok(diesel::update(custom_address_invoice::table)
+        let mut cancelled = diesel::update(custom_address_invoice::table)
             .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
             .filter(custom_address_invoice::expires_at.le(diesel::dsl::now))
             .set(custom_address_invoice::state.eq(InvoiceState::Cancelled as i32))
-            .execute(conn)?)
+            .execute(conn)?;
+
+        let pending_invoices = custom_address_invoice::table
+            .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
+            .order(custom_address_invoice::id.asc())
+            .load::<Self>(conn)?;
+
+        for invoice in pending_invoices {
+            if invoice.has_expired() && invoice.mark_cancelled(conn)? {
+                cancelled += 1;
+            }
+        }
+
+        Ok(cancelled)
     }
 
     pub fn cancel_expired_pending_for_name(
         conn: &mut PgConnection,
         address_name: &str,
     ) -> anyhow::Result<usize> {
-        Ok(diesel::update(custom_address_invoice::table)
+        let mut cancelled = diesel::update(custom_address_invoice::table)
             .filter(custom_address_invoice::name.eq(address_name))
             .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
             .filter(custom_address_invoice::expires_at.le(diesel::dsl::now))
             .set(custom_address_invoice::state.eq(InvoiceState::Cancelled as i32))
-            .execute(conn)?)
+            .execute(conn)?;
+
+        let pending_invoices = custom_address_invoice::table
+            .filter(custom_address_invoice::name.eq(address_name))
+            .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
+            .order(custom_address_invoice::id.asc())
+            .load::<Self>(conn)?;
+
+        for invoice in pending_invoices {
+            if invoice.has_expired() && invoice.mark_cancelled(conn)? {
+                cancelled += 1;
+            }
+        }
+
+        Ok(cancelled)
+    }
+
+    fn has_expired(&self) -> bool {
+        let now = chrono::Utc::now().naive_utc();
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+            || self.created_at <= now - CUSTOM_ADDRESS_PENDING_TTL
+            || Bolt11Invoice::from_str(&self.bolt11).is_ok_and(|invoice| invoice.is_expired())
     }
 
     pub fn mark_lightning_settled_and_activate(

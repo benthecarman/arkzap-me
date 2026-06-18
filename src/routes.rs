@@ -10,7 +10,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::Html;
 use axum::{Extension, Json};
 use bitcoin::Network;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use diesel::Connection;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::pay::PayResponse;
@@ -26,6 +26,7 @@ use std::time::SystemTime;
 const MAX_NOSTR_PARAM_LEN: usize = 16 * 1024;
 const ARKADE_MIN_SENDABLE_MSATS: u64 = 333_000;
 const MAX_CUSTOM_SIGNATURE_LEN: usize = 128;
+const CUSTOM_ADDRESS_INVOICE_EXPIRY: ChronoDuration = ChronoDuration::hours(1);
 
 pub async fn root() -> Html<&'static str> {
     Html(concat!(
@@ -850,7 +851,7 @@ async fn create_custom_address_invoice_impl(
         preimage: String::new(),
         ark_payment_reference: None,
         state: InvoiceState::Pending as i32,
-        expires_at: invoice_expires_at(&invoice),
+        expires_at: custom_address_invoice_expires_at(&invoice),
     };
 
     let mut conn = state.db_pool.get()?;
@@ -866,6 +867,15 @@ async fn create_custom_address_invoice_impl(
         invoice.expires_at
     );
     Ok(invoice)
+}
+
+fn custom_address_invoice_expires_at(invoice: &Bolt11Invoice) -> Option<NaiveDateTime> {
+    let reservation_expires_at = Utc::now().naive_utc() + CUSTOM_ADDRESS_INVOICE_EXPIRY;
+    Some(
+        invoice_expires_at(invoice)
+            .map(|invoice_expires_at| invoice_expires_at.min(reservation_expires_at))
+            .unwrap_or(reservation_expires_at),
+    )
 }
 
 async fn refresh_custom_address_invoice_receive_status(
