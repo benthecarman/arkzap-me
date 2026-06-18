@@ -60,7 +60,7 @@ diesel::table! {
         ark_payment_reference -> Nullable<Text>,
         state -> Int4,
         created_at -> Timestamp,
-        expires_at -> Nullable<Timestamp>,
+        expires_at -> Timestamp,
         settled_at -> Nullable<Timestamp>,
     }
 }

@@ -869,13 +869,11 @@ async fn create_custom_address_invoice_impl(
     Ok(invoice)
 }
 
-fn custom_address_invoice_expires_at(invoice: &Bolt11Invoice) -> Option<NaiveDateTime> {
+fn custom_address_invoice_expires_at(invoice: &Bolt11Invoice) -> NaiveDateTime {
     let reservation_expires_at = Utc::now().naive_utc() + CUSTOM_ADDRESS_INVOICE_EXPIRY;
-    Some(
-        invoice_expires_at(invoice)
-            .map(|invoice_expires_at| invoice_expires_at.min(reservation_expires_at))
-            .unwrap_or(reservation_expires_at),
-    )
+    invoice_expires_at(invoice)
+        .map(|invoice_expires_at| invoice_expires_at.min(reservation_expires_at))
+        .unwrap_or(reservation_expires_at)
 }
 
 async fn refresh_custom_address_invoice_receive_status(
@@ -1507,7 +1505,7 @@ impl InvoiceExpiry for ArkadeInvoice {
 
 impl InvoiceExpiry for CustomAddressInvoice {
     fn expires_at(&self) -> Option<NaiveDateTime> {
-        self.expires_at
+        Some(self.expires_at)
     }
 
     fn bolt11(&self) -> Bolt11Invoice {

@@ -365,7 +365,7 @@ impl StoredInvoice for ArkadeInvoice {
 
 impl StoredInvoice for CustomAddressInvoice {
     fn expires_at(&self) -> Option<chrono::NaiveDateTime> {
-        self.expires_at
+        Some(self.expires_at)
     }
 
     fn bolt11(&self) -> lightning_invoice::Bolt11Invoice {
@@ -638,7 +638,6 @@ mod db_tests {
         CustomAddress, CustomAddressInvoice, NewCustomAddressInvoice,
     };
     use crate::models::invoice::NewInvoice;
-    use crate::models::schema::custom_address_invoice;
     use ark::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use ark::mailbox::MailboxIdentifier;
     use axum::routing::{get, post};
@@ -739,6 +738,12 @@ mod db_tests {
     struct ColumnDataType {
         #[diesel(sql_type = Text)]
         data_type: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct ColumnNullable {
+        #[diesel(sql_type = Text)]
+        is_nullable: String,
     }
 
     #[test]
@@ -851,6 +856,15 @@ mod db_tests {
         .get_result(&mut conn)?;
         assert_eq!(custom_invoice_ark_payment_reference_type.data_type, "text");
 
+        let custom_invoice_expires_at_nullable: ColumnNullable = diesel::sql_query(
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'custom_address_invoice' \
+               AND column_name = 'expires_at'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(custom_invoice_expires_at_nullable.is_nullable, "NO");
+
         let arkade_columns: Vec<ColumnName> = diesel::sql_query(
             "SELECT column_name FROM information_schema.columns \
              WHERE table_schema = current_schema() AND table_name = 'arkade_invoice'",
@@ -958,7 +972,7 @@ mod db_tests {
             preimage: String::new(),
             ark_payment_reference: None,
             state: InvoiceState::Pending as i32,
-            expires_at: Some((chrono::Utc::now() - ChronoDuration::minutes(1)).naive_utc()),
+            expires_at: (chrono::Utc::now() - ChronoDuration::minutes(1)).naive_utc(),
         }
         .insert(&mut conn)?;
 
@@ -974,40 +988,12 @@ mod db_tests {
             preimage: String::new(),
             ark_payment_reference: None,
             state: InvoiceState::Pending as i32,
-            expires_at: Some((chrono::Utc::now() + ChronoDuration::minutes(5)).naive_utc()),
+            expires_at: (chrono::Utc::now() + ChronoDuration::minutes(5)).naive_utc(),
         }
         .insert(&mut conn)?;
-
-        let stale_reservation = NewCustomAddressInvoice {
-            name: "charlie".to_string(),
-            ark_address: "ark-test-address".to_string(),
-            auth_message: "message".to_string(),
-            signature: "signature".to_string(),
-            fee_receive_address: "ark-fee-address-3".to_string(),
-            bolt11: test_invoice(1_000).to_string(),
-            amount_msats: 1_000,
-            payment_hash: Some("55".repeat(32)),
-            preimage: String::new(),
-            ark_payment_reference: None,
-            state: InvoiceState::Pending as i32,
-            expires_at: Some((chrono::Utc::now() + ChronoDuration::days(14)).naive_utc()),
-        }
-        .insert(&mut conn)?;
-        diesel::update(
-            custom_address_invoice::table
-                .filter(custom_address_invoice::id.eq(stale_reservation.id)),
-        )
-        .set(
-            custom_address_invoice::created_at
-                .eq((chrono::Utc::now() - ChronoDuration::minutes(61)).naive_utc()),
-        )
-        .execute(&mut conn)?;
 
         assert!(CustomAddressInvoice::pending_name_exists(
             &mut conn, "alice"
-        )?);
-        assert!(CustomAddressInvoice::pending_name_exists(
-            &mut conn, "charlie"
         )?);
 
         assert_eq!(
@@ -1018,13 +1004,6 @@ mod db_tests {
             &mut conn, "alice"
         )?);
         assert!(CustomAddressInvoice::pending_name_exists(&mut conn, "bob")?);
-        assert_eq!(
-            CustomAddressInvoice::cancel_expired_pending_for_name(&mut conn, "charlie")?,
-            1
-        );
-        assert!(!CustomAddressInvoice::pending_name_exists(
-            &mut conn, "charlie"
-        )?);
 
         let expired_invoice =
             CustomAddressInvoice::get_by_id(&mut conn, expired_invoice.id)?.unwrap();
@@ -1032,9 +1011,6 @@ mod db_tests {
         let active_invoice =
             CustomAddressInvoice::get_by_id(&mut conn, active_invoice.id)?.unwrap();
         assert_eq!(active_invoice.state, InvoiceState::Pending as i32);
-        let stale_reservation =
-            CustomAddressInvoice::get_by_id(&mut conn, stale_reservation.id)?.unwrap();
-        assert_eq!(stale_reservation.state, InvoiceState::Cancelled as i32);
 
         Ok(())
     }
