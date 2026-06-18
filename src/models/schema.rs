@@ -57,6 +57,7 @@ diesel::table! {
         payment_hash -> Nullable<Varchar>,
         #[max_length = 64]
         preimage -> Varchar,
+        ark_payment_reference -> Nullable<Text>,
         state -> Int4,
         created_at -> Timestamp,
         expires_at -> Nullable<Timestamp>,

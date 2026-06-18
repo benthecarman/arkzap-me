@@ -691,6 +691,7 @@ pub struct CustomAddressInvoiceResponse {
     pub fee_sats: u64,
     pub payment_hash: Option<String>,
     pub invoice: String,
+    pub ark_payment_reference: Option<String>,
     pub state: String,
     pub active: bool,
 }
@@ -840,6 +841,7 @@ async fn create_custom_address_invoice_impl(
         amount_msats: (fee_sats * 1_000) as i64,
         payment_hash: Some(invoice.payment_hash().to_string()),
         preimage: String::new(),
+        ark_payment_reference: None,
         state: InvoiceState::Pending as i32,
         expires_at: invoice_expires_at(&invoice),
     };
@@ -899,7 +901,10 @@ async fn refresh_custom_address_invoice_receive_status(
         );
         if receive.preimage_revealed_at.is_some() {
             let activated = invoice
-                .mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())
+                .mark_lightning_settled_and_activate(
+                    &mut conn,
+                    receive.payment_preimage.to_string(),
+                )
                 .map_err(|e| {
                     error!(
                         "Error activating custom address invoice {} payment_hash={payment_hash}: {e:?}",
@@ -927,9 +932,9 @@ async fn refresh_custom_address_invoice_receive_status(
         );
     }
 
-    let ark_paid = state
+    let ark_payment = state
         .barkd
-        .has_received_ark_payment(
+        .received_ark_payment(
             &invoice.fee_receive_address,
             (invoice.amount_msats / 1_000) as u64,
         )
@@ -946,12 +951,12 @@ async fn refresh_custom_address_invoice_receive_status(
         invoice.id,
         invoice.fee_receive_address,
         invoice.amount_msats / 1_000,
-        ark_paid
+        ark_payment.is_some()
     );
 
-    if ark_paid {
+    if let Some(ark_payment) = ark_payment {
         let activated = invoice
-            .mark_settled_and_activate(&mut conn, format!("ark:{}", invoice.fee_receive_address))
+            .mark_ark_settled_and_activate(&mut conn, ark_payment.reference.clone())
             .map_err(|e| {
                 error!(
                     "Error activating custom address invoice {} from Ark payment: {e:?}",
@@ -961,8 +966,13 @@ async fn refresh_custom_address_invoice_receive_status(
             })?;
         if activated {
             info!(
-                "Activated custom address {} for {} from Ark payment invoice_id={} fee_receive_address={}",
-                invoice.name, invoice.ark_address, invoice.id, invoice.fee_receive_address
+                "Activated custom address {} for {} from Ark payment invoice_id={} fee_receive_address={} reference={} amount_sats={}",
+                invoice.name,
+                invoice.ark_address,
+                invoice.id,
+                invoice.fee_receive_address,
+                ark_payment.reference,
+                ark_payment.amount_sat
             );
         } else {
             warn!(
@@ -1036,6 +1046,7 @@ fn custom_address_invoice_response(invoice: CustomAddressInvoice) -> CustomAddre
         fee_sats: (invoice.amount_msats / 1_000) as u64,
         payment_hash: invoice.payment_hash,
         invoice: invoice.bolt11,
+        ark_payment_reference: invoice.ark_payment_reference,
         state: invoice_state_name(invoice.state).to_string(),
         active: invoice.state == InvoiceState::Settled as i32,
     }

@@ -11,6 +11,12 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkPayment {
+    pub reference: String,
+    pub amount_sat: u64,
+}
+
 #[derive(Clone)]
 pub struct BarkdClient {
     config: Configuration,
@@ -135,11 +141,11 @@ impl BarkdClient {
         Ok(receives)
     }
 
-    pub async fn has_received_ark_payment(
+    pub async fn received_ark_payment(
         &self,
         address: &str,
         min_amount_sat: u64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<ArkPayment>> {
         info!(
             "Checking barkd wallet history for Ark payment address={} min_amount_sats={}",
             address, min_amount_sat
@@ -150,20 +156,31 @@ impl BarkdClient {
             .context("failed to list barkd wallet history")?;
 
         let movement_count = movements.len();
-        let received = movements.into_iter().any(|movement| {
-            movement.received_on.into_iter().any(|destination| {
-                matches!(
-                    destination.destination,
-                    PaymentMethod::Ark(received_address)
-                        if received_address == address && destination.amount.to_sat() >= min_amount_sat
-                )
+        let payment = movements.into_iter().find_map(|movement| {
+            movement.received_on.into_iter().find_map(|destination| {
+                let PaymentMethod::Ark(received_address) = destination.destination else {
+                    return None;
+                };
+
+                let amount_sat = destination.amount.to_sat();
+                if received_address == address && amount_sat >= min_amount_sat {
+                    Some(ArkPayment {
+                        reference: format!("bark-movement:{}", movement.id),
+                        amount_sat,
+                    })
+                } else {
+                    None
+                }
             })
         });
         info!(
             "Checked barkd wallet history for Ark payment address={} min_amount_sats={} movements={} received={}",
-            address, min_amount_sat, movement_count, received
+            address,
+            min_amount_sat,
+            movement_count,
+            payment.is_some()
         );
-        Ok(received)
+        Ok(payment)
     }
 }
 

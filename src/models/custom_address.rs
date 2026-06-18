@@ -55,6 +55,7 @@ pub struct CustomAddressInvoice {
     pub amount_msats: i64,
     pub payment_hash: Option<String>,
     pub preimage: String,
+    pub ark_payment_reference: Option<String>,
     pub state: i32,
     pub created_at: NaiveDateTime,
     pub expires_at: Option<NaiveDateTime>,
@@ -102,10 +103,27 @@ impl CustomAddressInvoice {
             .is_some())
     }
 
-    pub fn mark_settled_and_activate(
+    pub fn mark_lightning_settled_and_activate(
         &self,
         conn: &mut PgConnection,
         preimage: String,
+    ) -> anyhow::Result<bool> {
+        self.mark_settled_and_activate(conn, Some(preimage), None)
+    }
+
+    pub fn mark_ark_settled_and_activate(
+        &self,
+        conn: &mut PgConnection,
+        ark_payment_reference: String,
+    ) -> anyhow::Result<bool> {
+        self.mark_settled_and_activate(conn, None, Some(ark_payment_reference))
+    }
+
+    fn mark_settled_and_activate(
+        &self,
+        conn: &mut PgConnection,
+        preimage: Option<String>,
+        ark_payment_reference: Option<String>,
     ) -> anyhow::Result<bool> {
         conn.transaction::<_, anyhow::Error, _>(|conn| {
             if CustomAddress::name_exists(conn, &self.name)? {
@@ -118,7 +136,8 @@ impl CustomAddressInvoice {
                 .filter(custom_address_invoice::state.eq(InvoiceState::Pending as i32))
                 .set((
                     custom_address_invoice::state.eq(InvoiceState::Settled as i32),
-                    custom_address_invoice::preimage.eq(preimage),
+                    custom_address_invoice::preimage.eq(preimage.unwrap_or_default()),
+                    custom_address_invoice::ark_payment_reference.eq(ark_payment_reference),
                     custom_address_invoice::settled_at.eq(diesel::dsl::now),
                 ))
                 .execute(conn)?;
@@ -160,6 +179,7 @@ pub struct NewCustomAddressInvoice {
     pub amount_msats: i64,
     pub payment_hash: Option<String>,
     pub preimage: String,
+    pub ark_payment_reference: Option<String>,
     pub state: i32,
     pub expires_at: Option<NaiveDateTime>,
 }

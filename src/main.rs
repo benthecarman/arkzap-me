@@ -513,7 +513,9 @@ async fn claim_custom_address_invoice_if_paid(
 
     if receive.preimage_revealed_at.is_some() {
         let mut conn = state.db_pool.get()?;
-        if invoice.mark_settled_and_activate(&mut conn, receive.payment_preimage.to_string())? {
+        if invoice
+            .mark_lightning_settled_and_activate(&mut conn, receive.payment_preimage.to_string())?
+        {
             info!(
                 "Activated custom address {} for {} from invoice {} payment_hash={}",
                 invoice.name, invoice.ark_address, invoice.id, payment_hash
@@ -562,9 +564,9 @@ async fn claim_custom_address_invoice_if_ark_paid(
         invoice.fee_receive_address,
         invoice.amount_msats / 1_000
     );
-    let ark_paid = state
+    let ark_payment = state
         .barkd
-        .has_received_ark_payment(
+        .received_ark_payment(
             &invoice.fee_receive_address,
             (invoice.amount_msats / 1_000) as u64,
         )
@@ -576,21 +578,23 @@ async fn claim_custom_address_invoice_if_ark_paid(
             )
         })?;
 
-    if !ark_paid {
+    let Some(ark_payment) = ark_payment else {
         info!(
             "No Ark fee payment found for custom address invoice {} fee_receive_address={}",
             invoice.id, invoice.fee_receive_address
         );
         return Ok(false);
-    }
+    };
 
     let mut conn = state.db_pool.get()?;
-    if invoice
-        .mark_settled_and_activate(&mut conn, format!("ark:{}", invoice.fee_receive_address))?
-    {
+    if invoice.mark_ark_settled_and_activate(&mut conn, ark_payment.reference.clone())? {
         info!(
-            "Activated custom address {} for {} from Ark payment to {}",
-            invoice.name, invoice.ark_address, invoice.fee_receive_address
+            "Activated custom address {} for {} from Ark payment to {} reference={} amount_sats={}",
+            invoice.name,
+            invoice.ark_address,
+            invoice.fee_receive_address,
+            ark_payment.reference,
+            ark_payment.amount_sat
         );
     } else {
         warn!(
@@ -721,6 +725,12 @@ mod db_tests {
         column_name: String,
     }
 
+    #[derive(QueryableByName)]
+    struct ColumnDataType {
+        #[diesel(sql_type = Text)]
+        data_type: String,
+    }
+
     #[test]
     fn embedded_migrations_apply_and_revert() -> anyhow::Result<()> {
         let Some((schema, mut conn)) = TestSchema::new("migrations")? else {
@@ -810,6 +820,8 @@ mod db_tests {
             "ark_address",
             "fee_receive_address",
             "payment_hash",
+            "preimage",
+            "ark_payment_reference",
             "settled_at",
         ] {
             assert!(
@@ -819,6 +831,15 @@ mod db_tests {
                 "missing custom_address_invoice.{expected} column"
             );
         }
+
+        let custom_invoice_ark_payment_reference_type: ColumnDataType = diesel::sql_query(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'custom_address_invoice' \
+               AND column_name = 'ark_payment_reference'",
+        )
+        .get_result(&mut conn)?;
+        assert_eq!(custom_invoice_ark_payment_reference_type.data_type, "text");
 
         let arkade_columns: Vec<ColumnName> = diesel::sql_query(
             "SELECT column_name FROM information_schema.columns \
@@ -1003,6 +1024,7 @@ mod db_tests {
         assert_eq!(invoices[0].auth_message, auth_message);
         assert_eq!(invoices[0].signature, signature);
         assert_eq!(invoices[0].fee_receive_address, fee_receive_address);
+        assert_eq!(invoices[0].ark_payment_reference, None);
         assert_eq!(invoices[0].amount_msats, 50_000);
         assert_eq!(
             invoices[0].payment_hash.as_deref(),
@@ -1040,6 +1062,12 @@ mod db_tests {
 
         let custom_address = CustomAddress::get_by_name(&mut conn, "alice")?.unwrap();
         assert_eq!(custom_address.ark_address, ark_address);
+        let invoice = CustomAddressInvoice::get_by_id(&mut conn, purchase_id as i32)?.unwrap();
+        assert_eq!(
+            invoice.ark_payment_reference.as_deref(),
+            Some("bark-movement:1")
+        );
+        assert_eq!(invoice.preimage, "");
 
         Ok(())
     }
