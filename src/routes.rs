@@ -241,6 +241,30 @@ pub async fn root() -> Html<&'static str> {
       fill: currentColor;
     }
 
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111111;
+        --text: #f2f2f2;
+        --muted: #aaaaaa;
+        --line: #3a3a3a;
+        --panel: #1c1c1c;
+        --accent: #2dd4bf;
+        --accent-2: #fb923c;
+        --code: #ededed;
+      }
+
+      .mark {
+        background:
+          radial-gradient(circle at 28% 30%, rgba(45, 212, 191, 0.22), transparent 26%),
+          radial-gradient(circle at 68% 68%, rgba(251, 146, 60, 0.2), transparent 28%),
+          linear-gradient(135deg, #242424, #151515);
+      }
+
+      .mark::before {
+        border-color: rgba(242, 242, 242, 0.7);
+      }
+    }
+
     @media (max-width: 760px) {
       main {
         width: min(100% - 24px, 1080px);
