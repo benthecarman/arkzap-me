@@ -536,7 +536,7 @@ fn validate_amount_msats(
     if amount_msats < min_sendable || amount_msats > max_sendable {
         return Err(anyhow!("Amount out of bounds"));
     }
-    if amount_msats % 1_000 != 0 {
+    if !amount_msats.is_multiple_of(1_000) {
         return Err(anyhow!("Bark invoices must be denominated in whole sats"));
     }
 

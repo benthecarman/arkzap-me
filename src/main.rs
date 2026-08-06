@@ -1092,12 +1092,13 @@ mod db_tests {
             Some(invoice.payment_hash().to_string().as_str())
         );
 
-        let mock_state = barkd.state.lock().unwrap();
-        assert_eq!(
-            mock_state.invoice_description.as_deref(),
-            Some("arkzap.me custom address alice")
-        );
-        drop(mock_state);
+        {
+            let mock_state = barkd.state.lock().unwrap();
+            assert_eq!(
+                mock_state.invoice_description.as_deref(),
+                Some("arkzap.me custom address alice")
+            );
+        }
 
         {
             let mut mock_state = barkd.state.lock().unwrap();
