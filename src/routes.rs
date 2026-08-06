@@ -213,9 +213,32 @@ pub async fn root() -> Html<&'static str> {
     }
 
     footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
       padding-top: 36px;
       color: var(--muted);
       font-size: 14px;
+    }
+
+    .github-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      transition: color 150ms ease;
+    }
+
+    .github-link:hover,
+    .github-link:focus-visible {
+      color: var(--text);
+    }
+
+    .github-link svg {
+      width: 24px;
+      height: 24px;
+      fill: currentColor;
     }
 
     @media (max-width: 760px) {
@@ -277,9 +300,16 @@ pub async fn root() -> Html<&'static str> {
       </ul>
     </section>
 
-    <footer>arkzap.me runs arkzap-me v"#,
+    <footer>
+      <span>arkzap.me runs arkzap-me v"#,
         env!("CARGO_PKG_VERSION"),
-        r#".</footer>
+        r#".</span>
+      <a class="github-link" href="https://github.com/benthecarman/arkzap-me" aria-label="View arkzap-me on GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 .7C5.6.7.4 5.9.4 12.3c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.3.8-.6v-2.2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0C15.9 5 16.9 5.3 16.9 5.3c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6a11.6 11.6 0 0 0 7.8-10.9C23.6 5.9 18.4.7 12 .7Z"/>
+        </svg>
+      </a>
+    </footer>
   </main>
 </body>
 </html>"#
