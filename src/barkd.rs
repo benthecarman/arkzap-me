@@ -17,6 +17,13 @@ pub struct ArkPayment {
     pub amount_sat: u64,
 }
 
+pub fn revealed_preimage(receive: &LightningReceiveInfo) -> Option<&ark::lightning::Preimage> {
+    match receive.state.as_str() {
+        "preimage-revealed" | "delivering" | "settled" => receive.payment_preimage.as_ref(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct BarkdClient {
     config: Configuration,
@@ -114,10 +121,8 @@ impl BarkdClient {
         match lightning_api::get_receive_status(&self.config, identifier).await {
             Ok(status) => {
                 info!(
-                    "Received barkd receive status identifier={} preimage_revealed={} finished={}",
-                    identifier,
-                    status.preimage_revealed_at.is_some(),
-                    status.finished_at.is_some()
+                    "Received barkd receive status identifier={} state={} settled_at={:?}",
+                    identifier, status.state, status.settled_at
                 );
                 Ok(Some(status))
             }
@@ -150,7 +155,7 @@ impl BarkdClient {
             "Checking barkd wallet history for Ark payment address={} min_amount_sats={}",
             address, min_amount_sat
         );
-        let movements = history_api::list(&self.config)
+        let movements = history_api::list(&self.config, Some("ark"), Some(address))
             .await
             .map_err(barkd_error)
             .context("failed to list barkd wallet history")?;

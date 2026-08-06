@@ -1,3 +1,4 @@
+use crate::barkd::revealed_preimage;
 use crate::models::arkade_invoice::{ArkadeInvoice, NewArkadeInvoice};
 use crate::models::arkade_zap::ArkadeZap;
 use crate::models::custom_address::{CustomAddress, CustomAddressInvoice, NewCustomAddressInvoice};
@@ -908,17 +909,17 @@ async fn refresh_custom_address_invoice_receive_status(
 
     if let Some(receive) = receive.as_ref() {
         info!(
-            "Custom address invoice id={} Lightning receive status payment_hash={} preimage_revealed={} finished={}",
+            "Custom address invoice id={} Lightning receive status payment_hash={} state={} settled_at={:?}",
             invoice.id,
             payment_hash,
-            receive.preimage_revealed_at.is_some(),
-            receive.finished_at.is_some()
+            receive.state,
+            receive.settled_at
         );
-        if receive.preimage_revealed_at.is_some() {
+        if let Some(preimage) = revealed_preimage(receive) {
             let activated = invoice
                 .mark_lightning_settled_and_activate(
                     &mut conn,
-                    receive.payment_preimage.to_string(),
+                    preimage.to_string(),
                 )
                 .map_err(|e| {
                     error!(
@@ -993,23 +994,6 @@ async fn refresh_custom_address_invoice_receive_status(
             warn!(
                 "Custom address invoice Ark activation was a no-op invoice_id={} name={} fee_receive_address={}",
                 invoice.id, invoice.name, invoice.fee_receive_address
-            );
-        }
-    } else if receive
-        .as_ref()
-        .is_some_and(|receive| receive.finished_at.is_some())
-    {
-        let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
-            error!(
-                "Error marking custom address invoice {} cancelled payment_hash={payment_hash}: {e:?}",
-                invoice.id
-            );
-            server_error_response()
-        })?;
-        if cancelled {
-            info!(
-                "Cancelled terminal unpaid custom address invoice id={} payment_hash={}",
-                invoice.id, payment_hash
             );
         }
     } else if invoice_has_expired(invoice) {
@@ -1340,15 +1324,12 @@ async fn refresh_bark_invoice_receive_status(
 
     if let Some(receive) = receive {
         info!(
-            "Bark invoice receive status invoice_id={} payment_hash={} preimage_revealed={} finished={}",
-            invoice.id,
-            payment_hash,
-            receive.preimage_revealed_at.is_some(),
-            receive.finished_at.is_some()
+            "Bark invoice receive status invoice_id={} payment_hash={} state={} settled_at={:?}",
+            invoice.id, payment_hash, receive.state, receive.settled_at
         );
-        if receive.preimage_revealed_at.is_some() {
+        if let Some(preimage) = revealed_preimage(&receive) {
             let settled = invoice
-                .mark_settled(&mut conn, receive.payment_preimage.to_string())
+                .mark_settled(&mut conn, preimage.to_string())
                 .map_err(|e| {
                     error!("Error marking invoice settled for payment_hash={payment_hash}: {e:?}");
                     server_error_response()
@@ -1361,22 +1342,6 @@ async fn refresh_bark_invoice_receive_status(
             } else {
                 warn!(
                     "Bark invoice settle was a no-op invoice_id={} payment_hash={}",
-                    invoice.id, payment_hash
-                );
-            }
-        } else if receive.finished_at.is_some() {
-            let cancelled = invoice.mark_cancelled(&mut conn).map_err(|e| {
-                error!("Error marking invoice cancelled for payment_hash={payment_hash}: {e:?}");
-                server_error_response()
-            })?;
-            if cancelled {
-                info!(
-                    "Marked terminal unpaid Bark invoice cancelled invoice_id={} payment_hash={}",
-                    invoice.id, payment_hash
-                );
-            } else {
-                warn!(
-                    "Bark invoice cancellation was a no-op invoice_id={} payment_hash={}",
                     invoice.id, payment_hash
                 );
             }

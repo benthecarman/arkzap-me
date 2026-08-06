@@ -20,7 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use crate::arkade::ArkadeClient;
-use crate::barkd::BarkdClient;
+use crate::barkd::{revealed_preimage, BarkdClient};
 use crate::config::*;
 use crate::models::arkade_invoice::ArkadeInvoice;
 use crate::models::custom_address::CustomAddressInvoice;
@@ -427,31 +427,21 @@ fn apply_invoice_receive_status(
     payment_hash: &str,
     receive: &LightningReceiveInfo,
 ) -> anyhow::Result<()> {
-    if receive.preimage_revealed_at.is_some() {
+    if let Some(preimage) = revealed_preimage(receive) {
         info!(
             "Barkd receive ready to claim for invoice {} payment_hash={} \
-             preimage_revealed_at={:?} finished_at={:?}",
-            invoice.id, payment_hash, receive.preimage_revealed_at, receive.finished_at
+             state={} settled_at={:?}",
+            invoice.id, payment_hash, receive.state, receive.settled_at
         );
 
         let mut conn = state.db_pool.get()?;
-        if invoice.mark_settled(&mut conn, receive.payment_preimage.to_string())? {
+        if invoice.mark_settled(&mut conn, preimage.to_string())? {
             info!(
-                "Claimed invoice {} payment_hash={} amount_msats={} finished_at={:?}",
-                invoice.id, payment_hash, invoice.amount_msats, receive.finished_at
+                "Claimed invoice {} payment_hash={} amount_msats={} settled_at={:?}",
+                invoice.id, payment_hash, invoice.amount_msats, receive.settled_at
             );
         }
         return Ok(());
-    }
-
-    if receive.finished_at.is_some() {
-        let mut conn = state.db_pool.get()?;
-        if invoice.mark_cancelled(&mut conn)? {
-            info!(
-                "Cancelled terminal unpaid invoice {} payment_hash={} finished_at={:?}",
-                invoice.id, payment_hash, receive.finished_at
-            );
-        }
     }
 
     cancel_invoice_if_expired(state, invoice, payment_hash)?;
@@ -511,18 +501,16 @@ async fn claim_custom_address_invoice_if_paid(
     };
 
     info!(
-        "Custom address invoice {} Lightning receive status payment_hash={} preimage_revealed={} finished={}",
+        "Custom address invoice {} Lightning receive status payment_hash={} state={} settled_at={:?}",
         invoice.id,
         payment_hash,
-        receive.preimage_revealed_at.is_some(),
-        receive.finished_at.is_some()
+        receive.state,
+        receive.settled_at
     );
 
-    if receive.preimage_revealed_at.is_some() {
+    if let Some(preimage) = revealed_preimage(&receive) {
         let mut conn = state.db_pool.get()?;
-        if invoice
-            .mark_lightning_settled_and_activate(&mut conn, receive.payment_preimage.to_string())?
-        {
+        if invoice.mark_lightning_settled_and_activate(&mut conn, preimage.to_string())? {
             info!(
                 "Activated custom address {} for {} from invoice {} payment_hash={}",
                 invoice.name, invoice.ark_address, invoice.id, payment_hash
@@ -538,21 +526,6 @@ async fn claim_custom_address_invoice_if_paid(
 
     if claim_custom_address_invoice_if_ark_paid(state, &invoice).await? {
         return Ok(());
-    }
-
-    if receive.finished_at.is_some() {
-        let mut conn = state.db_pool.get()?;
-        if invoice.mark_cancelled(&mut conn)? {
-            info!(
-                "Cancelled terminal unpaid custom address invoice {} payment_hash={}",
-                invoice.id, payment_hash
-            );
-        } else {
-            warn!(
-                "Custom address invoice cancellation was a no-op invoice_id={} name={} payment_hash={}",
-                invoice.id, invoice.name, payment_hash
-            );
-        }
     }
 
     cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
