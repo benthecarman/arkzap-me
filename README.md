@@ -131,6 +131,57 @@ cargo run -- \
 
 For Bark-only mode, omit the Arkade options and pass `--disable-arkade`.
 
+## NixOS
+
+The flake provides the server package, a development shell, and a NixOS module.
+Import the module from your system flake and enable the service:
+
+```nix
+{
+  inputs.arkzap-me.url = "github:benthecarman/arkzap-me";
+
+  outputs = { nixpkgs, arkzap-me, ... }: {
+    nixosConfigurations.my-server = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        arkzap-me.nixosModules.default
+        ({ ... }: {
+          services.arkzap-me = {
+            enable = true;
+            environmentFiles = [ "/run/secrets/arkzap-me.env" ];
+            environment = {
+              LNURL_DOMAIN = "example.com";
+              LNURL_BARKD_URL = "http://127.0.0.1:3535";
+              LNURL_ARKADE_SERVER_URL = "http://127.0.0.1:7070";
+              LNURL_ARKADE_BOLTZ_URL = "http://127.0.0.1:9001";
+            };
+            # Leave this false when a reverse proxy is on the same host.
+            openFirewall = false;
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+Put secrets in the environment file. Keep this file out of the Nix store; for
+example, create it through `sops-nix` or `agenix`:
+
+```env
+LNURL_PG_URL=postgresql://arkzap:password@127.0.0.1/arkzap-me
+LNURL_NSEC=nsec...
+LNURL_ARKADE_XPRIV=xprv...
+LNURL_BARKD_TOKEN=...
+```
+
+The module does not create or configure PostgreSQL. `LNURL_PG_URL` can point to
+a local or remote database. The application runs embedded database migrations
+when the service starts.
+
+Build or run the package directly with `nix build` or `nix run`. Enter the Rust
+development environment with `nix develop`.
+
 ## API
 
 ### Service Info
