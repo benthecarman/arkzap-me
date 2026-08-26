@@ -1050,6 +1050,23 @@ mod db_tests {
             auth_message,
             format!("arkzap.me custom address\nname: alice\ndomain: example.com\nark_address: {ark_address}")
         );
+        assert_eq!(auth["signing"]["minimumBarkVersion"], "0.6.2");
+        assert_eq!(
+            auth["signing"]["cliCommand"],
+            json!(["bark", "message", "sign", auth_message, ark_address])
+        );
+        assert_eq!(auth["signing"]["barkdRequest"]["method"], "POST");
+        assert_eq!(
+            auth["signing"]["barkdRequest"]["path"],
+            "/api/v1/message/sign"
+        );
+        assert_eq!(
+            auth["signing"]["barkdRequest"]["body"],
+            json!({
+                "message": auth_message,
+                "address": ark_address,
+            })
+        );
         let signature = ark::message::sign(&vtxo_key, auth_message.as_bytes()).to_string();
 
         let created_response = client

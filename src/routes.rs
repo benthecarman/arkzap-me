@@ -772,13 +772,15 @@ pub async fn custom_address_auth_message(
     let name = normalize_custom_address_name(&params.name).map_err(handle_anyhow_error)?;
     let ark_address =
         validate_custom_target_address(&params.ark_address, &state).map_err(handle_anyhow_error)?;
-    let message = custom_address_signature_message(&state.domain, &name, &ark_address.to_string());
+    let ark_address = ark_address.to_string();
+    let message = custom_address_signature_message(&state.domain, &name, &ark_address);
 
     Ok(Json(json!({
         "status": "OK",
         "name": name,
-        "arkAddress": ark_address.to_string(),
+        "arkAddress": ark_address,
         "message": message,
+        "signing": custom_address_signing_instructions(&message, &ark_address),
     })))
 }
 
@@ -1174,6 +1176,21 @@ fn normalize_custom_address_name(name: &str) -> anyhow::Result<String> {
 
 fn custom_address_signature_message(domain: &str, name: &str, ark_address: &str) -> String {
     format!("arkzap.me custom address\nname: {name}\ndomain: {domain}\nark_address: {ark_address}")
+}
+
+fn custom_address_signing_instructions(message: &str, ark_address: &str) -> Value {
+    json!({
+        "minimumBarkVersion": "0.6.2",
+        "cliCommand": ["bark", "message", "sign", message, ark_address],
+        "barkdRequest": {
+            "method": "POST",
+            "path": "/api/v1/message/sign",
+            "body": {
+                "message": message,
+                "address": ark_address,
+            },
+        },
+    })
 }
 
 /// HTTP endpoint that provides the LNURL-pay metadata and parameters.
@@ -1624,6 +1641,28 @@ mod tests {
         assert_eq!(
             calc_metadata("ark1example", "example.com"),
             "[[\"text/identifier\",\"ark1example@example.com\"],[\"text/plain\",\"Sats for ark1example\"]]"
+        );
+    }
+
+    #[test]
+    fn custom_address_signing_instructions_use_bark_v0_6_2() {
+        let message = "arkzap.me custom address\nname: alice";
+        let address = "ark1example";
+
+        assert_eq!(
+            custom_address_signing_instructions(message, address),
+            json!({
+                "minimumBarkVersion": "0.6.2",
+                "cliCommand": ["bark", "message", "sign", message, address],
+                "barkdRequest": {
+                    "method": "POST",
+                    "path": "/api/v1/message/sign",
+                    "body": {
+                        "message": message,
+                        "address": address,
+                    },
+                },
+            })
         );
     }
 

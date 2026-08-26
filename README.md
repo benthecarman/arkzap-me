@@ -32,7 +32,7 @@ Postgres.
 - Rust toolchain
 - Postgres
 - Diesel CLI with Postgres support
-- A reachable `barkd` REST API
+- A reachable `barkd` v0.6.2 or later REST API
 - A reachable Arkade server
 - A reachable Boltz endpoint compatible with Arkade reverse swaps
 - An Arkade BIP32 xpriv used to claim reverse-swap VHTLCs
@@ -54,7 +54,7 @@ local `.env` file on startup.
 | `LNURL_PG_URL` | yes | | Postgres connection string used by the application |
 | `LNURL_NSEC` | yes | | Nostr secret key used for zap support |
 | `LNURL_BARKD_URL` | yes | | Base URL for the `barkd` REST API |
-| `LNURL_BARKD_TOKEN` | no | | Bearer token for the `barkd` REST API |
+| `LNURL_BARKD_TOKEN` | no | | Bearer token for `barkd`. Required unless `barkd` uses `--no-auth` on a loopback address |
 | `LNURL_DISABLE_ARKADE` | no | `false` | Disable Arkade address support |
 | `LNURL_ARKADE_XPRIV` | yes, unless Arkade is disabled | | BIP32 xpriv used by the Arkade SDK to claim reverse-swap VHTLCs |
 | `LNURL_ARKADE_SERVER_URL` | yes, unless Arkade is disabled | | Arkade server URL used by the Arkade SDK |
@@ -70,6 +70,11 @@ local `.env` file on startup.
 | `LNURL_DOMAIN` | no | `localhost:3000` | Public domain used in LNURL callbacks and Lightning addresses |
 
 Arkade addresses require a minimum amount of `333000` millisatoshis.
+
+Bark v0.6.2 does not read `BARKD_NO_AUTH`.
+
+If `barkd` listens on a loopback address, start it with `--no-auth`. For all
+other deployments, set `LNURL_BARKD_TOKEN` to the bearer token from `barkd`.
 
 Example `.env`:
 
@@ -236,19 +241,51 @@ Optional query parameters:
 Successful responses include a BOLT11 invoice in the `pr` field and a `verify`
 URL for checking settlement status.
 
-### Custom Lightning Addresses
+### Custom Lightning addresses
 
 Custom names map a short local-part like `alice` to a Bark Ark address. Names are
 3 to 32 characters and may contain lowercase letters, numbers, hyphens, and
 underscores. Arkade addresses are not supported for custom names.
 
-Get the message that must be signed by the Bark address owner:
+Get the ownership message:
 
 ```http
 GET /custom-addresses/auth-message?name=alice&arkAddress=ark...
 ```
 
-Create the fee invoice by submitting the Bark address signature:
+Use Bark v0.6.2 or later to sign this message.
+
+The response includes these signing methods:
+
+- `signing.cliCommand` is an argument list for the Bark CLI.
+- `signing.barkdRequest` contains the method, path, and JSON body for the
+  `barkd` REST API.
+
+With the Bark CLI, pass each list item as a separate argument. Do not change
+the message item.
+
+The Bark CLI uses this command form:
+
+```sh
+bark message sign "<message>" "<ark-address>"
+```
+
+The `barkd` REST API uses this request form:
+
+```http
+POST /api/v1/message/sign
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "message": "<message>",
+  "address": "<ark-address>"
+}
+```
+
+Copy the `signature` value from the Bark JSON response.
+
+Submit the Bark address signature to create the fee invoice:
 
 ```http
 POST /custom-addresses
