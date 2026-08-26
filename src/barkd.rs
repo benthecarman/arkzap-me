@@ -108,9 +108,11 @@ impl BarkdClient {
         let signature =
             schnorr::Signature::from_str(&signature).context("invalid Schnorr signature")?;
 
-        Ok(address
-            .verify_message(message.as_bytes(), &signature)
-            .is_ok())
+        Ok(ark::message::verify_for_address(
+            &address,
+            message.as_bytes(),
+            &signature,
+        ))
     }
 
     pub async fn receive_status(

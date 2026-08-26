@@ -1050,10 +1050,7 @@ mod db_tests {
             auth_message,
             format!("arkzap.me custom address\nname: alice\ndomain: example.com\nark_address: {ark_address}")
         );
-        let signature = ark_address
-            .parse::<ark::Address>()?
-            .sign_message(auth_message.as_bytes(), &vtxo_key)?
-            .to_string();
+        let signature = ark::message::sign(&vtxo_key, auth_message.as_bytes()).to_string();
 
         let created_response = client
             .post(format!("{}/custom-addresses", app.base_url()))
