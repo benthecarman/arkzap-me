@@ -33,7 +33,7 @@
               ];
             };
 
-            cargoHash = "sha256-j99I7bnzyHQv5iH9uGUV57bpnot+Uu/EmMQCEEvg3iQ=";
+            cargoHash = "sha256-kokYAvZKMFOBVlK7BuaENOcvpz6J3T1N/siXzoLOPwQ=";
 
             nativeBuildInputs = [
               pkgs.pkg-config
@@ -46,7 +46,7 @@
 
             # bark-rest's build script otherwise tries to inspect a .git directory,
             # which is intentionally absent from Nix's vendored Cargo sources.
-            GIT_HASH = "09e5b81d220d16f1e876df4aa772185640301528";
+            GIT_HASH = "6188e2d809f193716b2e571274179f069d9c19ca";
 
             meta = {
               description = "LNURL server for Bark and Arkade";

@@ -13,8 +13,9 @@ name = "arkzap-me"
 path = "src/main.rs"
 
 [dependencies]
-ark-lib = "0.6.2"
-bark-rest-client = "0.6.2"
+# Bark 0.7.0 is tagged upstream but is not yet published on crates.io.
+ark-lib = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "6188e2d809f193716b2e571274179f069d9c19ca" }
+bark-rest-client = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "6188e2d809f193716b2e571274179f069d9c19ca" }
 ark-bdk-wallet = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
 ark-client = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
 ark-core = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }

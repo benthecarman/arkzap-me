@@ -305,6 +305,12 @@ purchase until it is active:
 GET /custom-addresses/:id
 ```
 
+Name reservations are set to expire after at most one hour. If Bark has accepted
+the Lightning payment, the name stays reserved until that payment resolves,
+even after invoice expiry. The service checks for Lightning and Ark fee
+payments before it releases an expired reservation. If the payment status cannot
+be checked, the reservation stays pending until a later check succeeds.
+
 Once active, `<name>@example.com` works through the normal LNURL-pay and verify
 endpoints for life. The same Bark address can sign a new message and pay another
 fee to claim another available name.
@@ -316,8 +322,10 @@ GET /verify/:address/:payment_hash
 ```
 
 Returns `settled: true` and the payment `preimage` once the Bark or Arkade
-backend has revealed and stored the preimage for the invoice. Pending, expired,
-or cancelled invoices return `settled: false`.
+backend has revealed and stored the preimage for the invoice. Pending and
+cancelled invoices return `settled: false`. Accepted Bark payments stay pending
+through invoice expiry and can settle later. Unpaid Bark invoices are cancelled
+after expiry once Bark reports an awaiting payment or no receive record.
 
 ## Development
 

@@ -24,6 +24,12 @@ pub fn revealed_preimage(receive: &LightningReceiveInfo) -> Option<&ark::lightni
     }
 }
 
+/// Invoice expiry limits payment initiation, not completion of an accepted payment.
+/// Keep unknown states pending so a new Bark state cannot cancel a payment in progress.
+pub fn receive_allows_expiry(receive: &LightningReceiveInfo) -> bool {
+    receive.state == "awaiting-payment"
+}
+
 #[derive(Clone)]
 pub struct BarkdClient {
     config: Configuration,

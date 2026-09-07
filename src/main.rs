@@ -20,7 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use crate::arkade::ArkadeClient;
-use crate::barkd::{revealed_preimage, BarkdClient};
+use crate::barkd::{receive_allows_expiry, revealed_preimage, BarkdClient};
 use crate::config::*;
 use crate::models::arkade_invoice::ArkadeInvoice;
 use crate::models::custom_address::CustomAddressInvoice;
@@ -257,13 +257,6 @@ async fn claim_paid_bark_invoices_once(state: &State) -> anyhow::Result<()> {
 async fn claim_paid_custom_address_invoices_once(state: &State) -> anyhow::Result<()> {
     let invoices = {
         let mut conn = state.db_pool.get()?;
-        let cancelled = CustomAddressInvoice::cancel_expired_pending(&mut conn)?;
-        if cancelled > 0 {
-            info!(
-                "Cancelled {} expired pending custom address invoice(s)",
-                cancelled
-            );
-        }
         CustomAddressInvoice::get_by_state(&mut conn, InvoiceState::Pending as i32)?
     };
 
@@ -444,7 +437,9 @@ fn apply_invoice_receive_status(
         return Ok(());
     }
 
-    cancel_invoice_if_expired(state, invoice, payment_hash)?;
+    if receive_allows_expiry(receive) {
+        cancel_invoice_if_expired(state, invoice, payment_hash)?;
+    }
 
     Ok(())
 }
@@ -528,7 +523,9 @@ async fn claim_custom_address_invoice_if_paid(
         return Ok(());
     }
 
-    cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
+    if receive_allows_expiry(&receive) {
+        cancel_custom_address_invoice_if_expired(state, &invoice, &payment_hash)?;
+    }
 
     Ok(())
 }
@@ -925,7 +922,7 @@ mod db_tests {
     }
 
     #[test]
-    fn custom_address_invoice_model_cancels_expired_pending_names() -> anyhow::Result<()> {
+    fn custom_address_invoice_model_releases_cancelled_names() -> anyhow::Result<()> {
         let Some((_schema, mut conn)) = TestSchema::new("custom_invoice_expiry")? else {
             return Ok(());
         };
@@ -969,10 +966,7 @@ mod db_tests {
             &mut conn, "alice"
         )?);
 
-        assert_eq!(
-            CustomAddressInvoice::cancel_expired_pending_for_name(&mut conn, "alice")?,
-            1
-        );
+        assert!(expired_invoice.mark_cancelled(&mut conn)?);
         assert!(!CustomAddressInvoice::pending_name_exists(
             &mut conn, "alice"
         )?);
@@ -1007,6 +1001,9 @@ mod db_tests {
             invoice: invoice.to_string(),
             invoice_description: None,
             ark_payment_received: false,
+            receive_status: None,
+            receive_error: false,
+            list_error: false,
         })
         .await?;
 
@@ -1148,12 +1145,306 @@ mod db_tests {
         Ok(())
     }
 
+    struct ExpiredBarkPayment {
+        state: State,
+        barkd: MockBarkd,
+        invoice: Invoice,
+        custom_invoice: CustomAddressInvoice,
+        _schema: TestSchema,
+    }
+
+    impl ExpiredBarkPayment {
+        async fn new() -> anyhow::Result<Option<Self>> {
+            let Some((schema, _conn)) = TestSchema::new("bark_expiry")? else {
+                return Ok(None);
+            };
+            let db_pool = schema.pool()?;
+            run_migrations(&db_pool)?;
+            let address = test_bark_address()?.0.to_string();
+            let bolt11 = test_invoice_at(50_000, Duration::from_secs(1));
+            assert!(bolt11.is_expired());
+            let barkd = MockBarkd::start(MockBarkdState {
+                expected_fee_receive_address: address.clone(),
+                expected_amount_sat: 50,
+                invoice: bolt11.to_string(),
+                invoice_description: None,
+                ark_payment_received: false,
+                receive_status: None,
+                receive_error: false,
+                list_error: false,
+            })
+            .await?;
+            let state = State {
+                db_pool,
+                keys: Keys::generate(),
+                barkd: Arc::new(BarkdClient::new(barkd.base_url(), None)?),
+                arkade: None,
+                domain: "example.com".to_string(),
+                network: bitcoin::Network::Bitcoin,
+                min_sendable: 1_000,
+                max_sendable: 1_000_000,
+                custom_address_fee_sats: 50,
+            };
+            let (invoice, custom_invoice) = {
+                let mut conn = state.db_pool.get()?;
+                let expires_at = (chrono::Utc::now() - ChronoDuration::minutes(1)).naive_utc();
+                let invoice = NewInvoice {
+                    ark_address: address.clone(),
+                    bolt11: bolt11.to_string(),
+                    amount_msats: 50_000,
+                    payment_hash: Some(bolt11.payment_hash().to_string()),
+                    preimage: String::new(),
+                    lnurlp_comment: None,
+                    state: InvoiceState::Pending as i32,
+                    expires_at: Some(expires_at),
+                }
+                .insert(&mut conn)?;
+                let custom_invoice = NewCustomAddressInvoice {
+                    name: "alice".to_string(),
+                    ark_address: address.clone(),
+                    auth_message: "message".to_string(),
+                    signature: "signature".to_string(),
+                    fee_receive_address: address,
+                    bolt11: bolt11.to_string(),
+                    amount_msats: 50_000,
+                    payment_hash: Some(bolt11.payment_hash().to_string()),
+                    preimage: String::new(),
+                    ark_payment_reference: None,
+                    state: InvoiceState::Pending as i32,
+                    expires_at,
+                }
+                .insert(&mut conn)?;
+                (invoice, custom_invoice)
+            };
+            Ok(Some(Self {
+                state,
+                barkd,
+                invoice,
+                custom_invoice,
+                _schema: schema,
+            }))
+        }
+
+        fn set_receive(&self, phase: &str, with_preimage: bool) {
+            self.barkd.state.lock().unwrap().receive_status = Some(json!({
+                "payment_hash": self.invoice.payment_hash,
+                "state": phase,
+                "invoice": self.invoice.bolt11,
+                "payment_preimage": with_preimage.then(|| "08".repeat(32)),
+                "amount_sat": 50,
+                "htlc_vtxo_ids": [],
+                "settled_at": null,
+            }));
+        }
+
+        fn assert_state(&self, expected: InvoiceState) -> anyhow::Result<()> {
+            let mut conn = self.state.db_pool.get()?;
+            let invoice = Invoice::get_by_id(&mut conn, self.invoice.id)?.unwrap();
+            let custom =
+                CustomAddressInvoice::get_by_id(&mut conn, self.custom_invoice.id)?.unwrap();
+            assert_eq!(invoice.state, expected as i32);
+            assert_eq!(custom.state, expected as i32);
+            assert_eq!(
+                CustomAddress::name_exists(&mut conn, "alice")?,
+                expected == InvoiceState::Settled
+            );
+            assert_eq!(
+                CustomAddressInvoice::pending_name_exists(&mut conn, "alice")?,
+                expected == InvoiceState::Pending
+            );
+            if expected == InvoiceState::Settled {
+                assert_eq!(invoice.preimage, "08".repeat(32));
+                assert_eq!(custom.preimage, "08".repeat(32));
+            }
+            Ok(())
+        }
+
+        async fn refresh_routes(&self) -> anyhow::Result<()> {
+            let result = verify(
+                axum::extract::Path((
+                    self.invoice.ark_address.clone(),
+                    invoice_payment_hash(&self.invoice),
+                )),
+                Extension(self.state.clone()),
+            )
+            .await;
+            let _ = result.map_err(|e| anyhow::anyhow!("verify failed: {e:?}"))?;
+            let _ = get_custom_address_invoice(
+                axum::extract::Path(self.custom_invoice.id),
+                Extension(self.state.clone()),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("custom invoice refresh failed: {e:?}"))?;
+            Ok(())
+        }
+
+        async fn request_same_name(&self) -> Result<Json<Value>, (http::StatusCode, Json<Value>)> {
+            let (address, key) = test_bark_address().unwrap();
+            let message = format!("arkzap.me custom address\nname: alice\ndomain: example.com\nark_address: {address}");
+            create_custom_address_invoice(
+                Extension(self.state.clone()),
+                Json(CreateCustomAddressInvoiceRequest {
+                    name: "alice".to_string(),
+                    ark_address: address.to_string(),
+                    signature: ark::message::sign(&key, message.as_bytes()).to_string(),
+                }),
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_bark_payments_settle_after_invoice_expiry() -> anyhow::Result<()> {
+        for list_error in [false, true] {
+            for final_phase in ["preimage-revealed", "delivering", "settled"] {
+                let Some(payment) = ExpiredBarkPayment::new().await? else {
+                    return Ok(());
+                };
+                payment.barkd.state.lock().unwrap().list_error = list_error;
+                payment.set_receive("htlcs-ready", true);
+
+                // Both the batch poller and its per-invoice fallback must retain accepted payments.
+                claim_paid_bark_invoices_once(&payment.state).await?;
+                payment.assert_state(InvoiceState::Pending)?;
+                payment.refresh_routes().await?;
+                payment.assert_state(InvoiceState::Pending)?;
+
+                // A competing name request must not expire the accepted fee payment.
+                let (_, Json(error)) = payment.request_same_name().await.unwrap_err();
+                assert_eq!(
+                    error["reason"],
+                    "Custom address already has a pending invoice"
+                );
+                payment.assert_state(InvoiceState::Pending)?;
+
+                payment.set_receive(final_phase, true);
+                // Exercise settlement through each entry point, then check idempotent polling.
+                if list_error {
+                    payment.refresh_routes().await?;
+                }
+                claim_paid_bark_invoices_once(&payment.state).await?;
+                payment.refresh_routes().await?;
+                payment.assert_state(InvoiceState::Settled)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bark_expiry_requires_an_unpaid_or_missing_receive() -> anyhow::Result<()> {
+        for phase in [
+            None,
+            Some("awaiting-payment"),
+            Some("unknown-state"),
+            Some("preimage-revealed"),
+            Some("delivering"),
+            Some("settled"),
+        ] {
+            let Some(payment) = ExpiredBarkPayment::new().await? else {
+                return Ok(());
+            };
+            if let Some(phase) = phase {
+                // An awaiting payment can expose a known preimage without having revealed it.
+                payment.set_receive(phase, phase == "awaiting-payment");
+            }
+            let expected = if phase.is_none() || phase == Some("awaiting-payment") {
+                InvoiceState::Cancelled
+            } else {
+                InvoiceState::Pending
+            };
+            payment.refresh_routes().await?;
+            payment.assert_state(expected)?;
+            claim_paid_bark_invoices_once(&payment.state).await?;
+            payment.assert_state(expected)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bark_status_errors_keep_expired_payments_and_names_pending() -> anyhow::Result<()> {
+        let Some(payment) = ExpiredBarkPayment::new().await? else {
+            return Ok(());
+        };
+        {
+            let mut mock = payment.barkd.state.lock().unwrap();
+            mock.receive_error = true;
+            mock.list_error = true;
+        }
+        claim_paid_bark_invoices_once(&payment.state).await?;
+        payment.assert_state(InvoiceState::Pending)?;
+        assert!(payment.refresh_routes().await.is_err());
+        assert!(get_custom_address_invoice(
+            axum::extract::Path(payment.custom_invoice.id),
+            Extension(payment.state.clone())
+        )
+        .await
+        .is_err());
+        assert!(payment.request_same_name().await.is_err());
+        payment.assert_state(InvoiceState::Pending)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_unpaid_custom_name_can_be_reserved_again() -> anyhow::Result<()> {
+        let Some(payment) = ExpiredBarkPayment::new().await? else {
+            return Ok(());
+        };
+        payment.set_receive("awaiting-payment", true);
+        let key = BitcoinSecretKey::from_slice(&[42; 32])?;
+        let fresh_invoice = InvoiceBuilder::new(Currency::Bitcoin)
+            .amount_milli_satoshis(50_000)
+            .description("replacement custom address fee".to_string())
+            .payment_hash(sha256::Hash::hash(&[9; 32]))
+            .payment_secret(PaymentSecret([9; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|hash| BitcoinSecp256k1::new().sign_ecdsa_recoverable(hash, &key))?;
+        payment.barkd.state.lock().unwrap().invoice = fresh_invoice.to_string();
+
+        let Json(created) = payment
+            .request_same_name()
+            .await
+            .map_err(|e| anyhow::anyhow!("replacement reservation failed: {e:?}"))?;
+        assert_eq!(created["invoice"]["state"], "pending");
+        assert_ne!(created["invoice"]["id"], payment.custom_invoice.id);
+        let mut conn = payment.state.db_pool.get()?;
+        let old = CustomAddressInvoice::get_by_id(&mut conn, payment.custom_invoice.id)?.unwrap();
+        assert_eq!(old.state, InvoiceState::Cancelled as i32);
+        let replacement = CustomAddressInvoice::get_pending_by_name(&mut conn, "alice")?.unwrap();
+        assert_eq!(replacement.bolt11, fresh_invoice.to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_custom_name_checks_ark_payment_before_cancelling() -> anyhow::Result<()> {
+        let Some(payment) = ExpiredBarkPayment::new().await? else {
+            return Ok(());
+        };
+        payment.barkd.state.lock().unwrap().ark_payment_received = true;
+        // The same-name request must reconcile the old fee before releasing the name.
+        let (_, Json(error)) = payment.request_same_name().await.unwrap_err();
+        assert_eq!(error["reason"], "Custom address is already taken");
+        let mut conn = payment.state.db_pool.get()?;
+        let custom =
+            CustomAddressInvoice::get_by_id(&mut conn, payment.custom_invoice.id)?.unwrap();
+        assert_eq!(custom.state, InvoiceState::Settled as i32);
+        assert_eq!(
+            custom.ark_payment_reference.as_deref(),
+            Some("bark-movement:1")
+        );
+        assert!(CustomAddress::name_exists(&mut conn, "alice")?);
+        Ok(())
+    }
+
     struct MockBarkdState {
         expected_fee_receive_address: String,
         expected_amount_sat: u64,
         invoice: String,
         invoice_description: Option<String>,
         ark_payment_received: bool,
+        receive_status: Option<Value>,
+        receive_error: bool,
+        list_error: bool,
     }
 
     struct MockBarkd {
@@ -1175,6 +1466,7 @@ mod db_tests {
                     "/api/v1/lightning/receives/{identifier}",
                     get(mock_receive_status),
                 )
+                .route("/api/v1/lightning/receives", get(mock_list_receives))
                 .route("/api/v1/history", get(mock_history))
                 .with_state(state.clone());
             let (addr, shutdown) = spawn_router(app).await?;
@@ -1259,9 +1551,28 @@ mod db_tests {
     }
 
     async fn mock_receive_status(
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<MockBarkdState>>>,
         axum::extract::Path(_identifier): axum::extract::Path<String>,
-    ) -> axum::http::StatusCode {
-        axum::http::StatusCode::NOT_FOUND
+    ) -> Result<Json<Value>, axum::http::StatusCode> {
+        let state = state.lock().unwrap();
+        if state.receive_error {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        state
+            .receive_status
+            .clone()
+            .map(Json)
+            .ok_or(axum::http::StatusCode::NOT_FOUND)
+    }
+
+    async fn mock_list_receives(
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<MockBarkdState>>>,
+    ) -> Result<Json<Value>, axum::http::StatusCode> {
+        let state = state.lock().unwrap();
+        if state.list_error {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(Json(json!(state.receive_status.iter().collect::<Vec<_>>())))
     }
 
     async fn mock_history(
@@ -1302,8 +1613,17 @@ mod db_tests {
     }
 
     fn test_invoice(amount_msats: u64) -> lightning_invoice::Bolt11Invoice {
+        test_invoice_at(
+            amount_msats,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        )
+    }
+
+    fn test_invoice_at(amount_msats: u64, timestamp: Duration) -> lightning_invoice::Bolt11Invoice {
         let private_key = BitcoinSecretKey::from_slice(&[42; 32]).unwrap();
-        let payment_hash = sha256::Hash::from_slice(&[7; 32]).unwrap();
+        let payment_hash = sha256::Hash::hash(&[8; 32]);
         let payment_secret = PaymentSecret([9; 32]);
 
         InvoiceBuilder::new(Currency::Bitcoin)
@@ -1311,7 +1631,7 @@ mod db_tests {
             .description("custom address fee".to_string())
             .payment_hash(payment_hash)
             .payment_secret(payment_secret)
-            .current_timestamp()
+            .duration_since_epoch(timestamp)
             .min_final_cltv_expiry_delta(144)
             .build_signed(|hash| BitcoinSecp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
             .unwrap()
