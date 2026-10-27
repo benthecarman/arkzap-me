@@ -9,14 +9,14 @@ use axum::extract::{Path, Query};
 use axum::http::{StatusCode, Uri};
 use axum::response::Html;
 use axum::{Extension, Json};
-use bitcoin::Network;
+use bitcoin::{Network, XOnlyPublicKey};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use diesel::Connection;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::pay::PayResponse;
 use lnurl::Tag;
 use log::{error, info, warn};
-use nostr::{Event, JsonUtil};
+use nostr::event::{Event, Kind};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Display;
@@ -399,7 +399,7 @@ pub(crate) async fn get_invoice_impl(
         None => calc_metadata(&invoice_identifier, &state.domain),
         Some(str) => {
             let event = Event::from_json(str).map_err(|_| anyhow!("Invalid zap request"))?;
-            if event.kind != nostr::Kind::ZapRequest {
+            if event.kind != Kind::ZapRequest {
                 return Err(anyhow!("Invalid zap request"));
             }
             zap_request = Some(event);
@@ -1106,10 +1106,7 @@ pub async fn get_lnurl_pay(
         comment_allowed: None,
         allows_nostr: Some(true),
         nostr_pubkey: Some(
-            state
-                .keys
-                .public_key()
-                .xonly()
+            XOnlyPublicKey::from_slice(state.keys.public_key().as_bytes())
                 .expect("cant get xonly pubkey"),
         ),
     };

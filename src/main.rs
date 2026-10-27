@@ -10,7 +10,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use log::{error, info, warn};
-use nostr::Keys;
+use nostr::key::Keys;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -54,7 +54,7 @@ pub struct State {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     pretty_env_logger::try_init()?;
     let config: Config = Config::parse();
 
@@ -632,7 +632,7 @@ mod db_tests {
 
     impl TestSchema {
         fn new(test_name: &str) -> anyhow::Result<Option<(Self, PgConnection)>> {
-            dotenv::dotenv().ok();
+            dotenvy::dotenv().ok();
 
             let Ok(database_url) = env::var("LNURL_TEST_DATABASE_URL") else {
                 eprintln!("skipping {test_name}: LNURL_TEST_DATABASE_URL is not set");

@@ -1,16 +1,13 @@
 use anyhow::Context;
 use ark_bdk_wallet::Wallet as BdkArkWallet;
-use ark_client::wallet::Persistence;
 use ark_client::{
-    Bip32KeyProvider, Blockchain, ChainSwapData, Client, Error as ArkadeError, OfflineClient,
+    Blockchain, ChainSwapData, Client, Error as ArkadeError, OfflineClient, OfflineClientConfig,
     ReverseSwapData, SpendStatus, SubmarineSwapData, SwapAmount, SwapStatus, SwapStorage, TxStatus,
 };
-use ark_core::{ArkAddress, BoardingOutput, ExplorerUtxo};
+use ark_core::{ArkAddress, ExplorerUtxo};
 use async_trait::async_trait;
 use bitcoin::bip32::Xpriv;
-use bitcoin::key::Secp256k1;
-use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Address, Amount, Network, Transaction, Txid, XOnlyPublicKey};
+use bitcoin::{Address, Amount, Network, Transaction, Txid};
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use lightning_invoice::Bolt11Invoice;
@@ -18,15 +15,14 @@ use log::info;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::models::schema::arkade_swap_storage;
 use diesel::prelude::*;
 
 type DbPool = Pool<ConnectionManager<PgConnection>>;
-type SdkWallet = BdkArkWallet<InMemoryBoardingPersistence>;
-type SdkClient = Client<NoopBlockchain, SdkWallet, PostgresSwapStorage, Bip32KeyProvider>;
+type SdkClient = Client<NoopBlockchain, BdkArkWallet, PostgresSwapStorage>;
 
 #[derive(Clone)]
 pub struct ArkadeClient {
@@ -53,36 +49,24 @@ impl ArkadeClient {
         request_timeout_seconds: u64,
     ) -> anyhow::Result<Self> {
         let xpriv = Xpriv::from_str(&xpriv).context("invalid Arkade xpriv")?;
-        let secp = Secp256k1::new();
         let wallet = Arc::new(
-            BdkArkWallet::new_from_xpriv(
-                xpriv,
-                secp,
-                network,
-                &esplora_url,
-                InMemoryBoardingPersistence::default(),
-            )
-            .context("failed to initialize Arkade BDK wallet")?,
+            BdkArkWallet::new_from_xpriv(xpriv, network, &esplora_url)
+                .context("failed to initialize Arkade BDK wallet")?,
         );
 
-        let offline = OfflineClient::<
-            NoopBlockchain,
-            SdkWallet,
-            PostgresSwapStorage,
-            Bip32KeyProvider,
-        >::new_with_bip32(
-            "arkzap-me".to_string(),
+        let config = OfflineClientConfig {
+            ark_server_url,
+            boltz_url,
+            timeout: Duration::from_secs(request_timeout_seconds),
+            ..Default::default()
+        };
+        let offline = OfflineClient::with_bip32(
+            config,
             xpriv,
             None,
             Arc::new(NoopBlockchain),
             wallet,
-            ark_server_url,
             Arc::new(PostgresSwapStorage::new(db_pool)),
-            boltz_url,
-            None,
-            Duration::from_secs(request_timeout_seconds),
-            None,
-            vec![],
         );
 
         let client = offline
@@ -151,46 +135,6 @@ impl ArkadeClient {
 
         info!("Claimed Arkade receive swap_id={swap_id}");
         Ok(result.preimage)
-    }
-}
-
-#[derive(Clone, Default)]
-struct InMemoryBoardingPersistence {
-    outputs: Arc<Mutex<Vec<(SecretKey, BoardingOutput)>>>,
-}
-
-impl Persistence for InMemoryBoardingPersistence {
-    fn save_boarding_output(
-        &self,
-        sk: SecretKey,
-        boarding_output: BoardingOutput,
-    ) -> Result<(), ArkadeError> {
-        self.outputs
-            .lock()
-            .map_err(|e| ArkadeError::wallet(format!("boarding persistence lock failed: {e}")))?
-            .push((sk, boarding_output));
-        Ok(())
-    }
-
-    fn load_boarding_outputs(&self) -> Result<Vec<BoardingOutput>, ArkadeError> {
-        Ok(self
-            .outputs
-            .lock()
-            .map_err(|e| ArkadeError::wallet(format!("boarding persistence lock failed: {e}")))?
-            .iter()
-            .map(|(_, output)| output.clone())
-            .collect())
-    }
-
-    fn sk_for_pk(&self, pk: &XOnlyPublicKey) -> Result<SecretKey, ArkadeError> {
-        let outputs = self
-            .outputs
-            .lock()
-            .map_err(|e| ArkadeError::wallet(format!("boarding persistence lock failed: {e}")))?;
-        outputs
-            .iter()
-            .find_map(|(sk, output)| (output.owner_pk() == *pk).then_some(*sk))
-            .ok_or_else(|| ArkadeError::wallet(format!("boarding secret key not found for {pk}")))
     }
 }
 

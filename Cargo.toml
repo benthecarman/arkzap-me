@@ -13,12 +13,11 @@ name = "arkzap-me"
 path = "src/main.rs"
 
 [dependencies]
-# Bark 0.7.0 is tagged upstream but is not yet published on crates.io.
-ark-lib = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "6188e2d809f193716b2e571274179f069d9c19ca" }
-bark-rest-client = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "6188e2d809f193716b2e571274179f069d9c19ca" }
-ark-bdk-wallet = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
-ark-client = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
-ark-core = { git = "https://github.com/arkade-os/rust-sdk.git", rev = "4f5c2590923985459101edcfeefa77965efe280e" }
+ark-lib = "0.8.0"
+bark-rest-client = "0.8.0"
+ark-bdk-wallet = "0.12.0"
+ark-client = "0.12.0"
+ark-core = "0.12.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -28,12 +27,11 @@ clap = { version = "4.1.14", features = ["derive", "env"] }
 chrono = { version = "0.4.26", features = ["serde"] }
 diesel = { version = "2.1", features = ["postgres", "postgres_backend", "r2d2", "chrono", "numeric", "serde_json"] }
 diesel_migrations = "2.1"
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 lnurl-rs = { version = "0.9.0", default-features = false }
 lightning-invoice = { version = "0.33.2", features = ["serde", "std"] }
 log = "0.4"
-nostr = { version = "0.44.3", default-features = false, features = ["nip57"] }
-nostr-sdk = "0.44.1"
+nostr = { version = "0.45.5", default-features = false, features = ["std", "os-rng"] }
 pretty_env_logger = "0.5.0"
 reqwest = { version = "0.13", features = ["json"] }
 serde = "1.0"
