@@ -1,4 +1,6 @@
-use crate::models::schema::zaps;
+use crate::models::invoice::{Invoice, InvoiceState};
+use crate::models::schema::{invoice, zaps};
+use diesel::dsl::{now, IntervalDsl};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -48,5 +50,19 @@ impl Zap {
             .execute(conn)?;
 
         Ok(())
+    }
+
+    /// Zaps settled within the last `window_hours` that have no published receipt yet.
+    pub fn get_unpublished_settled(
+        conn: &mut PgConnection,
+        window_hours: i32,
+    ) -> anyhow::Result<Vec<(Zap, Invoice)>> {
+        Ok(zaps::table
+            .inner_join(invoice::table)
+            .filter(invoice::state.eq(InvoiceState::Settled as i32))
+            .filter(invoice::settled_at.gt((now - window_hours.hours()).nullable()))
+            .filter(zaps::event_id.is_null())
+            .order(invoice::settled_at.asc())
+            .load::<(Zap, Invoice)>(conn)?)
     }
 }

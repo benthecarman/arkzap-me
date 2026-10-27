@@ -23,7 +23,7 @@ Postgres.
 - Bark address support through `barkd`
 - Paid custom Lightning address names for Bark addresses
 - Arkade address support through the Arkade SDK receive-for-user branch
-- Optional Nostr zap request storage
+- Nostr zaps: validates zap requests and publishes zap receipts once paid
 - Postgres persistence through Diesel migrations
 - Settlement verification at `/verify/:address/:payment_hash`
 
@@ -36,7 +36,7 @@ Postgres.
 - A reachable Arkade server
 - A reachable Boltz endpoint compatible with Arkade reverse swaps
 - An Arkade BIP32 xpriv used to claim reverse-swap VHTLCs
-- A Nostr `nsec` key for zap metadata
+- A Nostr `nsec` key used to sign zap receipts
 
 Install Diesel CLI if needed:
 
@@ -52,7 +52,7 @@ local `.env` file on startup.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `LNURL_PG_URL` | yes | | Postgres connection string used by the application |
-| `LNURL_NSEC` | yes | | Nostr secret key used for zap support |
+| `LNURL_NSEC` | yes | | Nostr secret key used to sign zap receipts |
 | `LNURL_BARKD_URL` | yes | | Base URL for the `barkd` REST API |
 | `LNURL_BARKD_TOKEN` | no | | Bearer token for `barkd`. Required unless `barkd` uses `--no-auth` on a loopback address |
 | `LNURL_DISABLE_ARKADE` | no | `false` | Disable Arkade address support |
@@ -236,7 +236,11 @@ require at least `333000` millisatoshis.
 
 Optional query parameters:
 
-- `nostr`: serialized Nostr zap request event
+- `nostr`: serialized NIP-57 zap request event. The request must be signed,
+  have exactly one `p` tag, list at least one public relay in its `relays`
+  tag, and match `amount` if it has an `amount` tag. After the invoice is
+  paid, a zap receipt signed with `LNURL_NSEC` is published to up to 10 of the
+  listed relays. Failed publishes are retried for 24 hours.
 
 Successful responses include a BOLT11 invoice in the `pr` field and a `verify`
 URL for checking settlement status.

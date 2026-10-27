@@ -34,6 +34,7 @@ mod config;
 mod models;
 mod rate_limit;
 mod routes;
+mod zap_receipts;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -43,6 +44,8 @@ pub struct State {
     pub keys: Keys,
     pub barkd: Arc<BarkdClient>,
     pub arkade: Option<Arc<ArkadeClient>>,
+    /// Wakes the zap receipt publisher after an invoice settles.
+    pub zap_receipts: Arc<tokio::sync::Notify>,
 
     // -- config options --
     pub domain: String,
@@ -105,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         keys: keys.clone(),
         barkd,
         arkade,
+        zap_receipts: Arc::new(tokio::sync::Notify::new()),
         domain: config.domain,
         network: config.network,
         min_sendable: config.min_sendable,
@@ -113,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     tokio::spawn(claim_paid_invoices(state.clone()));
+    tokio::spawn(zap_receipts::run(state.clone()));
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
@@ -308,6 +313,7 @@ async fn claim_paid_arkade_invoices_once(state: &State) -> anyhow::Result<()> {
                         "Claimed Arkade invoice {} payment_hash={} amount_msats={} swap_id={}",
                         invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
                     );
+                    state.zap_receipts.notify_one();
                 }
             }
             Err(e) => {
@@ -433,6 +439,7 @@ fn apply_invoice_receive_status(
                 "Claimed invoice {} payment_hash={} amount_msats={} settled_at={:?}",
                 invoice.id, payment_hash, invoice.amount_msats, receive.settled_at
             );
+            state.zap_receipts.notify_one();
         }
         return Ok(());
     }
@@ -608,6 +615,7 @@ mod db_tests {
         CustomAddress, CustomAddressInvoice, NewCustomAddressInvoice,
     };
     use crate::models::invoice::NewInvoice;
+    use crate::models::zap::Zap;
     use ark::bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use ark::mailbox::MailboxIdentifier;
     use axum::routing::{get, post};
@@ -922,6 +930,51 @@ mod db_tests {
     }
 
     #[test]
+    fn unpublished_zaps_only_include_settled_invoices() -> anyhow::Result<()> {
+        let Some((_schema, mut conn)) = TestSchema::new("unpublished_zaps")? else {
+            return Ok(());
+        };
+
+        conn.run_pending_migrations(MIGRATIONS)
+            .map_err(|e| anyhow::anyhow!("failed to run migrations: {e}"))?;
+
+        let new_invoice = |bolt11: &str, payment_hash: String| NewInvoice {
+            ark_address: "ark-test-address".to_string(),
+            bolt11: bolt11.to_string(),
+            amount_msats: 1_000,
+            payment_hash: Some(payment_hash),
+            preimage: String::new(),
+            lnurlp_comment: None,
+            state: InvoiceState::Pending as i32,
+            expires_at: Some((chrono::Utc::now() + ChronoDuration::minutes(5)).naive_utc()),
+        };
+        let pending = new_invoice("lnbc1pending", "00".repeat(32)).insert(&mut conn)?;
+        let settled = new_invoice("lnbc1settled", "11".repeat(32)).insert(&mut conn)?;
+        for invoice in [&pending, &settled] {
+            Zap {
+                id: invoice.id,
+                request: format!("request-{}", invoice.id),
+                event_id: None,
+            }
+            .insert(&mut conn)?;
+        }
+
+        assert!(Zap::get_unpublished_settled(&mut conn, 24)?.is_empty());
+
+        assert!(settled.mark_settled(&mut conn, "22".repeat(32))?);
+        let unpublished = Zap::get_unpublished_settled(&mut conn, 24)?;
+        assert_eq!(unpublished.len(), 1);
+        let (zap, invoice) = &unpublished[0];
+        assert_eq!(zap.id, settled.id);
+        assert_eq!(invoice.preimage, "22".repeat(32));
+
+        zap.set_event_id(&mut conn, "33".repeat(32))?;
+        assert!(Zap::get_unpublished_settled(&mut conn, 24)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn custom_address_invoice_model_releases_cancelled_names() -> anyhow::Result<()> {
         let Some((_schema, mut conn)) = TestSchema::new("custom_invoice_expiry")? else {
             return Ok(());
@@ -1012,6 +1065,7 @@ mod db_tests {
             keys: Keys::generate(),
             barkd: Arc::new(BarkdClient::new(barkd.base_url(), None)?),
             arkade: None,
+            zap_receipts: Arc::new(tokio::sync::Notify::new()),
             domain: "example.com".to_string(),
             network: bitcoin::Network::Bitcoin,
             min_sendable: 1_000,
@@ -1179,6 +1233,7 @@ mod db_tests {
                 keys: Keys::generate(),
                 barkd: Arc::new(BarkdClient::new(barkd.base_url(), None)?),
                 arkade: None,
+                zap_receipts: Arc::new(tokio::sync::Notify::new()),
                 domain: "example.com".to_string(),
                 network: bitcoin::Network::Bitcoin,
                 min_sendable: 1_000,

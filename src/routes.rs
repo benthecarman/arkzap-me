@@ -16,7 +16,7 @@ use lightning_invoice::Bolt11Invoice;
 use lnurl::pay::PayResponse;
 use lnurl::Tag;
 use log::{error, info, warn};
-use nostr::event::{Event, Kind};
+use nostr::event::Event;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Display;
@@ -317,7 +317,7 @@ pub async fn root() -> Html<&'static str> {
       <h2>What It Does</h2>
       <div class="grid">
         <div class="item"><strong>LNURL-pay</strong><span>Publishes pay metadata for Bark, Arkade, and paid custom names.</span></div>
-        <div class="item"><strong>Nostr zaps</strong><span>Accepts zap request events and stores invoice verification data.</span></div>
+        <div class="item"><strong>Nostr zaps</strong><span>Validates zap requests and publishes zap receipts once invoices are paid.</span></div>
         <div class="item"><strong>Settlement checks</strong><span>Exposes verification for pending and settled invoices.</span></div>
       </div>
     </section>
@@ -399,10 +399,9 @@ pub(crate) async fn get_invoice_impl(
         None => calc_metadata(&invoice_identifier, &state.domain),
         Some(str) => {
             let event = Event::from_json(str).map_err(|_| anyhow!("Invalid zap request"))?;
-            if event.kind != Kind::ZapRequest {
-                return Err(anyhow!("Invalid zap request"));
-            }
-            zap_request = Some(event);
+            crate::zap_receipts::validate_zap_request(&event, amount_msats)
+                .map_err(|e| anyhow!("Invalid zap request: {e}"))?;
+            zap_request = Some(str.clone());
             str.clone()
         }
     };
@@ -473,7 +472,7 @@ pub(crate) async fn get_invoice_impl(
                 if let Some(zap_request) = zap_request {
                     let zap = Zap {
                         id: inserted_invoice.id,
-                        request: zap_request.as_json(),
+                        request: zap_request,
                         event_id: None,
                     };
                     zap.insert(conn)?;
@@ -500,7 +499,7 @@ pub(crate) async fn get_invoice_impl(
                 if let Some(zap_request) = zap_request {
                     let zap = ArkadeZap {
                         id: inserted_invoice.id,
-                        request: zap_request.as_json(),
+                        request: zap_request,
                         event_id: None,
                     };
                     zap.insert(conn)?;
@@ -1323,6 +1322,7 @@ async fn refresh_arkade_invoice_receive_status(
                     "Marked Arkade invoice settled invoice_id={} payment_hash={} amount_msats={} swap_id={}",
                     invoice.id, payment_hash, invoice.amount_msats, invoice.swap_id
                 );
+                state.zap_receipts.notify_one();
             } else {
                 warn!(
                     "Arkade invoice settle was a no-op invoice_id={} payment_hash={} swap_id={}",
